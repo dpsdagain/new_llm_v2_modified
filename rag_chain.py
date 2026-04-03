@@ -336,20 +336,23 @@ def build_rag_chain(db: Chroma, model: str | None = None):
     if is_cc:
         system_blocks = [
             format_message_content(CORE_INSTRUCTIONS, model, use_cache=True)[0],
-            format_message_content("FULL SOURCE CONTEXT (PINNED):\n{full_source_context}", model, use_cache=True)[0]
+            format_message_content("FULL SOURCE CONTEXT (PINNED):\n{full_source_context}", model, use_cache=True)[0],
+            # 🚀 Tier 2 Refinement: Context block is now part of the stable System prefix.
+            # We place it ABOVE the chat history to ensure the RAG knowledge is cached.
+            format_message_content("RETRIEVED RAG CHUNKS (DYNAMIC):\n{context}", model, use_cache=True)[0]
         ]
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_blocks),
             MessagesPlaceholder("chat_history"),
-            ("human", "RETRIEVED RAG CHUNKS (DYNAMIC):\n{context}\n\nUser Question:\n{input}"),
+            ("human", "{input}"),
         ])
     else:
         # Fallback to plain-string system prompt for maximum reliability
-        system_text = f"{CORE_INSTRUCTIONS}\n\nFULL SOURCE CONTEXT (PINNED):\n{{full_source_context}}"
+        system_text = f"{CORE_INSTRUCTIONS}\n\nFULL SOURCE CONTEXT (PINNED):\n{{full_source_context}}\n\nRETRIEVED RAG CHUNKS (DYNAMIC):\n{{context}}"
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_text),
             MessagesPlaceholder("chat_history"),
-            ("human", "RETRIEVED RAG CHUNKS (DYNAMIC):\n{context}\n\nUser Question:\n{input}"),
+            ("human", "{input}"),
         ])
 
     question_answer_chain = create_stuff_documents_chain(llm, prompt)

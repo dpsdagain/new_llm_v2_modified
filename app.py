@@ -417,18 +417,26 @@ if user_input:
                     # 1. Embed query
                     q_vector = st.session_state.vector_db.embeddings.embed_query(user_input)
                     
+                    # 🚀 Tier 2 Refinement: Anaphoric Meta-Query Detection
+                    # Detects generic follow-ups like "Explain that" or "Tell me more"
+                    is_meta = False
+                    import re
+                    # Short follow-ups that imply "Stay on the same topic"
+                    META_SIG_REGEX = re.compile(r"^(explain|tell|show|more|go on|why|how|elaborate|expand|again|understand|context)", re.IGNORECASE)
+                    if len(user_input.split()) <= 5 and META_SIG_REGEX.search(user_input):
+                        is_meta = True
+
                     # 2. Check for cache hit
                     if st.session_state.last_query_vector is not None:
                         sim = np.dot(q_vector, st.session_state.last_query_vector)
                         
                         # High similarity hit
-                        if sim > 0.78:
+                        if sim > 0.78 or is_meta:
                             cached_docs = st.session_state.last_docs
                         # Medium similarity fallback: Term Overlap
                         elif sim > 0.70:
                             # Re-use stopword logic from rag_chain to avoid mismatched heuristics
                             from rag_chain import STOPWORDS
-                            import re
                             q_tokens = {t.lower() for t in re.split(r"\W+", user_input) if t.lower() not in STOPWORDS and len(t) > 1}
                             l_tokens = {t.lower() for t in re.split(r"\W+", st.session_state.get("last_query", "")) if t.lower() not in STOPWORDS and len(t) > 1}
                             
@@ -437,6 +445,12 @@ if user_input:
                 
                 # Update current query for next turn's comparison
                 st.session_state.last_query = user_input
+                
+                # 🚀 Anchor-based History Window (Turn 0 Anchor + Last 8 messages)
+                if len(lc_history) <= 10:
+                    truncated_history = lc_history
+                else:
+                    truncated_history = lc_history[:2] + lc_history[-8:]
                 
                 stream_iter = chain.stream({
                     "input": user_input, 
