@@ -194,12 +194,12 @@ class ScoringCrossEncoderReranker(CrossEncoderReranker):
             doc.metadata["reranker_score"] = round(float(score), 4)
             top_docs.append(doc)
         
-        # 🚀 ABSOLUTE DETERMINISM For Cache Stability
-        # We sort by (-round(score, 2), source, content).
-        # Rounding to 2 decimal places creates 'bins' of relevance,
-        # ensuring minor float jitter doesn't break the cache prefix,
-        # while the top-N results stay strictly at the top.
-        top_docs.sort(key=lambda d: (-round(float(d.metadata.get("reranker_score", 0)), 2), 
+        # 🚀 Tier 3: RELEVANCE BINS (Deterministic Reranking)
+        # We group chunks into 0.1-step bins (0.9, 0.8, etc.) for sorting.
+        # This ensures that minor score fluctuations from similar queries 
+        # do not break the LLM's prompt cache prefix, while 
+        # maintaining strictly professional ranking.
+        top_docs.sort(key=lambda d: (-round(float(d.metadata.get("reranker_score", 0)), 1), 
                                      d.metadata.get("source", ""), 
                                      d.page_content))
         return top_docs
@@ -393,11 +393,11 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         retriever = get_reranking_retriever(db, exclude_file=pinned_file)
         
         if skip_reformulation:
-            # 🚀 Tier 1 Refinement: Semantic Retrieval Caching support
-            # Use pre-fetched docs from app.py if available to skip DB search
-            docs = inputs.get("cached_docs")
-            if not docs:
-                docs = retriever.invoke(user_input)
+            # 🚀 Tier 3 Refinement: 100% Accurate Fresh Retrieval
+            # We perform a new database search on every turn to ensure zero
+            # accuracy loss, relying on the 'Relevance Bins' above to 
+            # naturally trigger the API prompt cache.
+            docs = retriever.invoke(user_input)
             
             inputs["context"] = docs
             # Normalise history format with model-awareness

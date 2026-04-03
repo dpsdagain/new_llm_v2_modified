@@ -122,13 +122,6 @@ if "pinned_file" not in st.session_state:
     st.session_state.pinned_file = None
 if "pinned_content" not in st.session_state:
     st.session_state.pinned_content = "None pinned."
-# 🚀 Tier 1 Refinement: Semantic Retrieval Cache State
-if "last_query_vector" not in st.session_state:
-    st.session_state.last_query_vector = None
-if "last_docs" not in st.session_state:
-    st.session_state.last_docs = []
-if "last_query" not in st.session_state:
-    st.session_state.last_query = ""
 if "vector_db" not in st.session_state:
     st.session_state.vector_db = None
 
@@ -172,9 +165,6 @@ with st.sidebar:
     if new_model_id != st.session_state.model_id:
         st.session_state.model_id = new_model_id
         st.session_state.rag_chain = None
-        # 🚀 Invalidation: Model change clears the retrieval cache
-        st.session_state.last_query_vector = None
-        st.session_state.last_docs = []
         st.toast(f"Switched to {selected_label}", icon="🤖")
 
     st.divider()
@@ -233,9 +223,6 @@ with st.sidebar:
         st.success(f"✅ Ingested **{added}** new chunks from `{uploaded_pdf.name}` ({len(chunks) - added} duplicates skipped)")
         st.session_state.active_collection = collection_name
         st.session_state.rag_chain = None        # force rebuild
-        # 🚀 Invalidation: New ingestion clears existing cache
-        st.session_state.last_query_vector = None
-        st.session_state.last_docs = []
 
     st.divider()
 
@@ -267,9 +254,6 @@ with st.sidebar:
                 st.success(f"✅ Ingested **{added}** new chunks from `{folder_path}` ({len(chunks) - added} duplicates skipped)")
                 st.session_state.active_collection = collection_name
                 st.session_state.rag_chain = None
-                # 🚀 Invalidation: Folder ingestion clears existing cache
-                st.session_state.last_query_vector = None
-                st.session_state.last_docs = []
 
     st.divider()
 
@@ -288,9 +272,6 @@ with st.sidebar:
             if st.button("🔗 Connect", use_container_width=True):
                 st.session_state.active_collection = chosen
                 st.session_state.rag_chain = None
-                # 🚀 Invalidation: Switching collections clears context
-                st.session_state.last_query_vector = None
-                st.session_state.last_docs = []
                 st.success(f"Connected to **{chosen}**")
         with col2:
             if st.button("🗑️ Delete", use_container_width=True):
@@ -306,9 +287,6 @@ with st.sidebar:
                     if st.session_state.active_collection == chosen:
                         st.session_state.active_collection = None
                         st.session_state.rag_chain = None
-                        # 🚀 Invalidation: Deleting active collection
-                        st.session_state.last_query_vector = None
-                        st.session_state.last_docs = []
                     st.session_state.pop("confirm_delete", None)
                     st.rerun()
             with c2:
@@ -409,43 +387,6 @@ if user_input:
             full_response = {"answer": "", "context": []}
 
             def response_generator():
-                # 🚀 Tier 1 Refinement: Semantic Retrieval Cache
-                cached_docs = None
-                q_vector = None
-                
-                if st.session_state.vector_db:
-                    # 1. Embed query
-                    q_vector = st.session_state.vector_db.embeddings.embed_query(user_input)
-                    
-                    # 🚀 Tier 2 Refinement: Anaphoric Meta-Query Detection
-                    # Detects generic follow-ups like "Explain that" or "Tell me more"
-                    is_meta = False
-                    import re
-                    # Short follow-ups that imply "Stay on the same topic"
-                    META_SIG_REGEX = re.compile(r"^(explain|tell|show|more|go on|why|how|elaborate|expand|again|understand|context)", re.IGNORECASE)
-                    if len(user_input.split()) <= 5 and META_SIG_REGEX.search(user_input):
-                        is_meta = True
-
-                    # 2. Check for cache hit
-                    if st.session_state.last_query_vector is not None:
-                        sim = np.dot(q_vector, st.session_state.last_query_vector)
-                        
-                        # High similarity hit
-                        if sim > 0.78 or is_meta:
-                            cached_docs = st.session_state.last_docs
-                        # Medium similarity fallback: Term Overlap
-                        elif sim > 0.70:
-                            # Re-use stopword logic from rag_chain to avoid mismatched heuristics
-                            from rag_chain import STOPWORDS
-                            q_tokens = {t.lower() for t in re.split(r"\W+", user_input) if t.lower() not in STOPWORDS and len(t) > 1}
-                            l_tokens = {t.lower() for t in re.split(r"\W+", st.session_state.get("last_query", "")) if t.lower() not in STOPWORDS and len(t) > 1}
-                            
-                            if q_tokens & l_tokens:
-                                cached_docs = st.session_state.last_docs
-                
-                # Update current query for next turn's comparison
-                st.session_state.last_query = user_input
-                
                 # 🚀 Anchor-based History Window (Turn 0 Anchor + Last 8 messages)
                 if len(lc_history) <= 10:
                     truncated_history = lc_history
@@ -457,15 +398,11 @@ if user_input:
                     "chat_history": truncated_history,
                     "full_source_context": st.session_state.pinned_content,
                     "exclude_file": st.session_state.pinned_file,
-                    "cached_docs": cached_docs # 🚀 Pass cached docs to bypass DB search
                 })
 
                 for chunk in stream_iter:
                     if "context" in chunk:
                         full_response["context"] = chunk["context"]
-                        # 🚀 Store the retrieved docs for the next turn
-                        st.session_state.last_docs = chunk["context"]
-                        st.session_state.last_query_vector = q_vector
                     if "answer" in chunk:
                         full_response["answer"] += chunk["answer"]
                         yield chunk["answer"]
