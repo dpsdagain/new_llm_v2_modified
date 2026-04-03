@@ -194,11 +194,11 @@ class ScoringCrossEncoderReranker(CrossEncoderReranker):
             doc.metadata["reranker_score"] = round(float(score), 4)
             top_docs.append(doc)
         
-        # 🚀 Platinum Standard: DETERMINISTIC RERANKING (Stable Prefix)
-        # We group chunks into 0.1-step relevance bins (0.9, 0.8, etc.) 
-        # and sort by (score_bin, source, content). This forces identical
-        # chunk order across similar queries to maximize API cache hits.
-        top_docs.sort(key=lambda d: (-round(float(d.metadata.get("reranker_score", 0)), 1), 
+        # 🚀 Accuracy-First: HIGHER-RESOLUTION DETERMINSTIC SORT (0.05 Bins)
+        # We group chunks into 0.05-precision bins (0.95, 0.90, 0.85, etc.) 
+        # for sorting. This doubles the precision of the Platinum Standard
+        # while preserving nearly identical prefix stability for caching.
+        top_docs.sort(key=lambda d: (-round(float(d.metadata.get("reranker_score", 0)) * 20) / 20.0, 
                                      d.metadata.get("source", ""), 
                                      d.page_content))
         return top_docs
@@ -253,12 +253,11 @@ def _prepare_history_with_cache(history: list[BaseMessage], model: str | None) -
     # Identify indices for breakpoints (e.g., start of history and mid-point)
     # We target the 'content' block to add the cache_control marker.
     for i, msg in enumerate(history):
-        # With our Anchor pattern (Turn 0 is always index 0), 
-        # BP 3 at i==0 is incredibly stable.
-        is_bp3 = (i == 0)
-        is_bp4 = (len(history) > 6 and i == len(history) // 2)
-
-        content = format_message_content(msg.content, model, use_cache=(is_bp3 or is_bp4))
+        # 🚀 Final Zero-Gaps: Exactly 4 Breakpoints 
+        # (1:Instructions, 2:Pinned, 3:RAG, 4:History Start)
+        # We keep only the START of the window cached to ensure BP4 limit.
+        is_history_start = (i == 0)
+        content = format_message_content(msg.content, model, use_cache=is_history_start)
 
         if isinstance(msg, HumanMessage):
             new_history.append(HumanMessage(content=content))
@@ -339,7 +338,11 @@ def build_rag_chain(db: Chroma, model: str | None = None):
             search_signal = user_input
             if history:
                 prev_human = history[-1].content if hasattr(history[-1], 'content') else ""
-                search_signal = f"{prev_human}\n{user_input}"
+                # 🛡️ DILUTION GUARD: Only enrichment the search signal if the 
+                # previous message was technical (> 15 chars) or the 
+                # current query is a shorthand (< 10 chars).
+                if len(prev_human) > 15 or len(user_input) < 10:
+                    search_signal = f"{prev_human}\n{user_input}"
             
             pinned_file = inputs.get("exclude_file")
             retriever = get_reranking_retriever(db, exclude_file=pinned_file)

@@ -80,6 +80,10 @@ _LANGUAGE_MAP: dict[str, Language] = {
     ".cs":    Language.CSHARP,
     ".html":  Language.HTML,
     ".md":    Language.MARKDOWN,
+    # 💎 Hardware Design (Verilog / SystemVerilog / VHDL)
+    ".v":     Language.CPP,  # Verilog syntax-aware splitting via C++ logic
+    ".sv":    Language.CPP,  # SystemVerilog
+    ".vhd":   Language.CPP,  # VHDL
 }
 
 
