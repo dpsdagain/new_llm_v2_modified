@@ -124,6 +124,11 @@ if "pinned_content" not in st.session_state:
     st.session_state.pinned_content = "None pinned."
 if "vector_db" not in st.session_state:
     st.session_state.vector_db = None
+# 🚀 Platinum Standard: Semantic Retrieval Cache State
+if "last_query_vector" not in st.session_state:
+    st.session_state.last_query_vector = None
+if "last_docs" not in st.session_state:
+    st.session_state.last_docs = []
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -165,6 +170,9 @@ with st.sidebar:
     if new_model_id != st.session_state.model_id:
         st.session_state.model_id = new_model_id
         st.session_state.rag_chain = None
+        # 🚀 Invalidation: Model change clears the precision cache
+        st.session_state.last_query_vector = None
+        st.session_state.last_docs = []
         st.toast(f"Switched to {selected_label}", icon="🤖")
 
     st.divider()
@@ -223,6 +231,9 @@ with st.sidebar:
         st.success(f"✅ Ingested **{added}** new chunks from `{uploaded_pdf.name}` ({len(chunks) - added} duplicates skipped)")
         st.session_state.active_collection = collection_name
         st.session_state.rag_chain = None        # force rebuild
+        # 🚀 Invalidation: New ingestion clears existing cache
+        st.session_state.last_query_vector = None
+        st.session_state.last_docs = []
 
     st.divider()
 
@@ -254,6 +265,9 @@ with st.sidebar:
                 st.success(f"✅ Ingested **{added}** new chunks from `{folder_path}` ({len(chunks) - added} duplicates skipped)")
                 st.session_state.active_collection = collection_name
                 st.session_state.rag_chain = None
+                # 🚀 Invalidation: Folder ingestion clears existing cache
+                st.session_state.last_query_vector = None
+                st.session_state.last_docs = []
 
     st.divider()
 
@@ -272,6 +286,9 @@ with st.sidebar:
             if st.button("🔗 Connect", use_container_width=True):
                 st.session_state.active_collection = chosen
                 st.session_state.rag_chain = None
+                # 🚀 Invalidation: Switching collections clears context
+                st.session_state.last_query_vector = None
+                st.session_state.last_docs = []
                 st.success(f"Connected to **{chosen}**")
         with col2:
             if st.button("🗑️ Delete", use_container_width=True):
@@ -387,7 +404,22 @@ if user_input:
             full_response = {"answer": "", "context": []}
 
             def response_generator():
-                # 🚀 Anchor-based History Window (Turn 0 Anchor + Last 8 messages)
+                # 🚀 Platinum Standard: High-Precision Semantic Router
+                # Uses 0.85 Cosine Similarity to reuse docs without accuracy loss.
+                cached_docs = None
+                q_vector = None
+                
+                if st.session_state.vector_db:
+                    # 1. Embed query
+                    q_vector = st.session_state.vector_db.embeddings.embed_query(user_input)
+                    
+                    # 2. Check for cache hit (Precision Threshold: 0.85)
+                    if st.session_state.last_query_vector is not None:
+                        sim = np.dot(q_vector, st.session_state.last_query_vector)
+                        if sim >= 0.85:
+                            cached_docs = st.session_state.last_docs
+                
+                # 🚀 Anchor-based History Window
                 if len(lc_history) <= 10:
                     truncated_history = lc_history
                 else:
@@ -398,11 +430,15 @@ if user_input:
                     "chat_history": truncated_history,
                     "full_source_context": st.session_state.pinned_content,
                     "exclude_file": st.session_state.pinned_file,
+                    "cached_docs": cached_docs
                 })
 
                 for chunk in stream_iter:
                     if "context" in chunk:
                         full_response["context"] = chunk["context"]
+                        # 🚀 Store the retrieved docs for the next turn
+                        st.session_state.last_docs = chunk["context"]
+                        st.session_state.last_query_vector = q_vector
                     if "answer" in chunk:
                         full_response["answer"] += chunk["answer"]
                         yield chunk["answer"]

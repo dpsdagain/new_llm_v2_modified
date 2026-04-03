@@ -194,11 +194,10 @@ class ScoringCrossEncoderReranker(CrossEncoderReranker):
             doc.metadata["reranker_score"] = round(float(score), 4)
             top_docs.append(doc)
         
-        # 🚀 Tier 3: RELEVANCE BINS (Deterministic Reranking)
-        # We group chunks into 0.1-step bins (0.9, 0.8, etc.) for sorting.
-        # This ensures that minor score fluctuations from similar queries 
-        # do not break the LLM's prompt cache prefix, while 
-        # maintaining strictly professional ranking.
+        # 🚀 Platinum Standard: DETERMINISTIC RERANKING (Stable Prefix)
+        # We group chunks into 0.1-step relevance bins (0.9, 0.8, etc.) 
+        # and sort by (score_bin, source, content). This forces identical
+        # chunk order across similar queries to maximize API cache hits.
         top_docs.sort(key=lambda d: (-round(float(d.metadata.get("reranker_score", 0)), 1), 
                                      d.metadata.get("source", ""), 
                                      d.page_content))
@@ -268,53 +267,12 @@ def _prepare_history_with_cache(history: list[BaseMessage], model: str | None) -
     return new_history
 
 # 🚀 Professional Polish: Linguistic Logic Gates (History vs Speed)
-import re
-STRICT_HISTORY_REGEX = re.compile(r"\b(above|previous|earlier|you said|you mentioned|as before|same as|go back)\b", re.IGNORECASE)
-PINNED_REF_REGEX = re.compile(r"\b(this file|the file|pinned file|the code|this code)\b", re.IGNORECASE)
-
-STOPWORDS = {
-    "the", "a", "is", "are", "do", "does", "what", "how", "why", "where", "when", 
-    "which", "can", "will", "should", "my", "your", "i", "it", "this", "that", 
-    "in", "on", "for", "to", "of", "and", "or", "with", "from", "about", "has", 
-    "have", "been", "not", "just", "any"
-}
-
-def is_pinned_content_relevant(query: str, content: str) -> bool:
-    """
-    Safety-First Relevance Gate: Determine if the pinned file should be included.
-    Uses size threshold, regex matches, and a fast keyword scanner.
-    """
-    # 1. Size Threshold: Files under ~3k tokens (12k chars) are always included.
-    if len(content) < 12000:
-        return True
-    
-    # 2. Explicit Reference: User mentioned 'this file' or similar.
-    if PINNED_REF_REGEX.search(query):
-        return True
-    
-    # 3. Keyword Overlap: Fast scanner on the first 100 lines.
-    q_tokens = {t.lower() for t in re.split(r"\W+", query) if t.lower() not in STOPWORDS and len(t) > 1}
-    # Scan only a representative sample of the file for speed
-    sample_content = "\n".join(content.splitlines()[:100])
-    f_tokens = {t.lower() for t in re.split(r"\W+", sample_content)}
-    
-    if q_tokens & f_tokens:
-        return True
-        
-    return False
+# ═══════════════════════════════════════════════════════════════════════════
+#  PLATINUM STANDARD: RAG UTILITIES
+# ═══════════════════════════════════════════════════════════════════════════
 
 
-# ── Prompt used to reformulate follow-up questions into standalone ones ────
-CONTEXTUALIZE_Q_PROMPT = ChatPromptTemplate.from_messages([
-    ("system",
-     "Given the chat history and the latest user question, "
-     "reformulate the question to be a standalone question that "
-     "can be understood without the chat history. "
-     "Do NOT answer the question — just reformulate it if needed, "
-     "otherwise return it as is."),
-    MessagesPlaceholder("chat_history"),
-    ("human", "{input}"),
-])
+# ═══════════════════════════════════════════════════════════════════════════
 
 
 def build_rag_chain(db: Chroma, model: str | None = None):
@@ -359,59 +317,41 @@ def build_rag_chain(db: Chroma, model: str | None = None):
 
     def _full_context_cache_chain(inputs: dict):
         """
-        Architecture Industrial Core: High-Efficiency logic with
-        Linguistic Logic Gates and Safety-First Relevance Gating.
+        Platinum Standard: Zero-Waste Unified Path.
+        Eliminates the 'Pre-flight' LLM call and enforces 100% vision.
         """
         user_input = inputs["input"]
         pinned_content = inputs.get("full_source_context", "")
         history = inputs.get("chat_history", [])
         
-        # 1. 🛡️ Safety-First Relevance Gate
-        # Decide if the pinned file is worth the token cost for this turn.
-        if pinned_content and pinned_content != "None pinned.":
-            if not is_pinned_content_relevant(user_input, pinned_content):
-                inputs["full_source_context"] = "[Large pinned file omitted for token efficiency. Ask about it specifically to re-enable.]"
-        else:
-            inputs["full_source_context"] = "None pinned."
+        # 1. 🚀 Platinum Vision: Absolute Recall
+        # Pinned files are always 100% visible (Zero-Chunking principle).
+        inputs["full_source_context"] = pinned_content if (pinned_content and pinned_content != "None pinned.") else "None pinned."
 
-        # 2. 🚀 Linguistic Logic Gate (Turn 1 & Smart Bypass)
-        # Priority: Accuracy (History match) > Speed (Pinned match) > Default Bypass (fresh conversation).
-        skip_reformulation = False
-        
-        if not history:
-            skip_reformulation = True
-        elif STRICT_HISTORY_REGEX.search(user_input):
-            skip_reformulation = False
-        elif PINNED_REF_REGEX.search(user_input):
-            skip_reformulation = True
-        elif len(history) <= 6:
-            # 🚀 Tier 1 Refinement: Raised threshold to 6 messages (3 full turns)
-            # for better speed in medium-length conversational bursts.
-            skip_reformulation = True
+        # 2. 🚀 Platinum Logic: Unified Zero-Waste Path
 
-        pinned_file = inputs.get("exclude_file")
-        retriever = get_reranking_retriever(db, exclude_file=pinned_file)
-        
-        if skip_reformulation:
-            # 🚀 Tier 3 Refinement: 100% Accurate Fresh Retrieval
-            # We perform a new database search on every turn to ensure zero
-            # accuracy loss, relying on the 'Relevance Bins' above to 
-            # naturally trigger the API prompt cache.
-            docs = retriever.invoke(user_input)
+        # 🚀 Zero-Waste Retrieval
+        docs = inputs.get("cached_docs")
+        if not docs:
+            # 🌊 Zero-Token Contextual Search
+            # Instead of a pre-flight LLM call, we enrich the search signal
+            # by prepending the human's last query to current input.
+            search_signal = user_input
+            if history:
+                prev_human = history[-1].content if hasattr(history[-1], 'content') else ""
+                search_signal = f"{prev_human}\n{user_input}"
             
-            inputs["context"] = docs
-            # Normalise history format with model-awareness
-            inputs["chat_history"] = _prepare_history_with_cache(history, model)
-            yield {"context": docs}
-            for chunk in question_answer_chain.stream(inputs):
-                yield {"answer": chunk}
-        else:
-            history_aware_retriever = create_history_aware_retriever(
-                llm, retriever, CONTEXTUALIZE_Q_PROMPT
-            )
-            full_rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
-            inputs["chat_history"] = _prepare_history_with_cache(history, model)
-            yield from full_rag_chain.stream(inputs)
+            pinned_file = inputs.get("exclude_file")
+            retriever = get_reranking_retriever(db, exclude_file=pinned_file)
+            docs = retriever.invoke(search_signal)
+        
+        inputs["context"] = docs
+        # Normalise history format with model-awareness
+        inputs["chat_history"] = _prepare_history_with_cache(history, model)
+        
+        yield {"context": docs}
+        for chunk in question_answer_chain.stream(inputs):
+            yield {"answer": chunk}
 
     from langchain_core.runnables import RunnableLambda
     return RunnableLambda(_full_context_cache_chain)
