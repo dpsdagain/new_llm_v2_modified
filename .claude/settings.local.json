@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(venv/Scripts/python check_models.py)",
+      "Bash(curl -s http://localhost:11434/api/tags)",
+      "Bash(venv/Scripts/python -c \"import requests; r = requests.get\\(''http://localhost:11434/api/tags''\\); print\\(r.json\\(\\)\\)\")",
+      "Bash(dir \"%USERPROFILE%\\\\.ollama\\\\models\\\\manifests\" /s /b)",
+      "Bash(findstr /v \"^$\")",
+      "Read(//f/Gemini_anti/new_llm/$USERPROFILE/.ollama/models/**)",
+      "Read(//c/Users/HP/.ollama/models/manifests/**)"
+    ]
+  }
+}
