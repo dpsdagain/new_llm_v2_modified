@@ -117,6 +117,10 @@ if "rag_chain" not in st.session_state:
     st.session_state.rag_chain = None
 if "model_id" not in st.session_state:
     st.session_state.model_id = GEMINI_MODEL
+if "pinned_file" not in st.session_state:
+    st.session_state.pinned_file = None
+if "pinned_content" not in st.session_state:
+    st.session_state.pinned_content = "None pinned."
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -162,8 +166,39 @@ with st.sidebar:
 
     st.divider()
 
-    # ── Collection name ────────────────────────────────────────────────
-    st.markdown("### 📂 Collection")
+    # ── Pinned Context (Architecture A) ────────────────────────────────
+    st.write("---")
+    st.markdown("### 📌 Pinned Context")
+    st.caption("Pin a full file to the cache for 'Total Vision' and 100% cache hits.")
+    
+    file_to_pin = st.text_input(
+        "Absolute File Path",
+        placeholder="C:\\path\\to\\file.py",
+        help="Paste the full path to the file you want to analyze deeply."
+    )
+    
+    if st.button("🚀 Pin to Cache"):
+        if os.path.exists(file_to_pin) and os.path.isfile(file_to_pin):
+            try:
+                with open(file_to_pin, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    st.session_state.pinned_file = file_to_pin
+                    st.session_state.pinned_content = f"FILE: {file_to_pin}\n\n{content}"
+                st.success(f"Pinned {os.path.basename(file_to_pin)}!")
+            except Exception as e:
+                st.error(f"Failed to read file: {e}")
+        else:
+            st.error("Invalid file path or file not found.")
+
+    if st.session_state.pinned_file:
+        st.info(f"✅ Active: **{os.path.basename(st.session_state.pinned_file)}**")
+        if st.button("❌ Unpin"):
+            st.session_state.pinned_file = None
+            st.session_state.pinned_content = "None pinned."
+            st.rerun()
+
+    st.write("---")
+    st.markdown("### 📂 Ingestion")
     collection_name = st.text_input(
         "Collection name",
         value="default",
@@ -349,7 +384,12 @@ if user_input:
             full_response = {"answer": "", "context": []}
 
             def response_generator():
-                for chunk in chain.stream({"input": user_input, "chat_history": lc_history}):
+                stream_iter = chain.stream({
+                    "input": user_input, 
+                    "chat_history": lc_history,
+                    "full_source_context": st.session_state.pinned_content
+                })
+                for chunk in stream_iter:
                     # Retrieval chain yields "context" first, then "answer" chunks
                     if "context" in chunk:
                         full_response["context"] = chunk["context"]

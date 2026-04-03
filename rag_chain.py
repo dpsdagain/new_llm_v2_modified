@@ -16,6 +16,7 @@ from langchain_classic.retrievers.document_compressors import CrossEncoderRerank
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 from langchain_community.chat_models import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import SystemMessage
 from langchain_openai import ChatOpenAI
 from langchain_chroma import Chroma
 
@@ -31,6 +32,16 @@ from config import (
     MAX_TOKENS,
     RERANKER_MODEL_NAME,
     RERANKER_TOP_N,
+    ANTHROPIC_CACHE_BETA_HEADER,
+    ENABLE_PROMPT_CACHING,
+    MAX_CACHE_CHECKPOINTS,
+)
+
+from langchain_core.messages import (
+    SystemMessage,
+    HumanMessage,
+    AIMessage,
+    BaseMessage,
 )
 
 # Prefix used by app.py to signal "use local Ollama with model X"
@@ -81,6 +92,8 @@ def get_llm(
         default_headers={
             "HTTP-Referer": "http://localhost:8501",
             "X-Title": "Private AI Knowledge Base",
+            # 🚀 Harnessing Prompt Caching from Claude Code
+            "anthropic-beta": ANTHROPIC_CACHE_BETA_HEADER,
         },
     )
 
@@ -137,6 +150,12 @@ class ScoringCrossEncoderReranker(CrossEncoderReranker):
         for doc, score in result[: self.top_n]:
             doc.metadata["reranker_score"] = round(float(score), 4)
             top_docs.append(doc)
+        
+        # 🚀 ABSOLUTE DETERMINISM For Cache Stability
+        # Sorting by (source, content) ensures the prompt string is 
+        # mathematically identical even if the DB returns results 
+        # in a slightly different order across turns.
+        top_docs.sort(key=lambda d: (d.metadata.get("source", ""), d.page_content))
         return top_docs
 
 
@@ -157,7 +176,8 @@ def get_reranking_retriever(db: Chroma, k: int | None = None):
 #  SYSTEM PROMPT
 # ═══════════════════════════════════════════════════════════════════════════
 
-SYSTEM_PROMPT = """\
+# 🚀 CORE INSTRUCTIONS (Static/Cached)
+CORE_INSTRUCTIONS = """\
 You are an expert AI assistant specialising in code analysis and document comprehension.
 
 INSTRUCTIONS:
@@ -168,10 +188,48 @@ INSTRUCTIONS:
 4. Be concise, precise, and use markdown formatting where helpful.
 5. If the user asks for code improvements, provide the improved version \
    with clear explanations.
-
-RETRIEVED CONTEXT:
-{context}
 """
+
+# 🚀 CONTEXT PROMPT (Dynamic/Uncached)
+CONTEXT_PROMPT = "RETRIEVED CONTEXT:\n{context}"
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  HISTORY CACHING HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _prepare_history_with_cache(history: list[BaseMessage]) -> list[BaseMessage]:
+    """
+    Inject cache markers into the chat history based on the 4-breakpoint limit.
+    BP 1 and 2 are used by the system instructions and context. 
+    BP 3 and 4 are used here to keep history 'warm'.
+    """
+    if not history or not ENABLE_PROMPT_CACHING or MAX_CACHE_CHECKPOINTS <= 2:
+        return history
+
+    new_history = []
+    # Identify indices for breakpoints (e.g., start of history and mid-point)
+    # We target the 'content' block to add the cache_control marker.
+    for i, msg in enumerate(history):
+        is_bp3 = (i == 0)
+        is_bp4 = (len(history) > 6 and i == len(history) // 2)
+
+        if is_bp3 or is_bp4:
+            # Convert to list-of-dicts format for Anthropic/OpenRouter
+            content = [
+                {
+                    "type": "text", 
+                    "text": msg.content, 
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ]
+        else:
+            content = msg.content
+
+        if isinstance(msg, HumanMessage):
+            new_history.append(HumanMessage(content=content))
+        else:
+            new_history.append(AIMessage(content=content))
+    return new_history
 
 # ── Prompt used to reformulate follow-up questions into standalone ones ────
 CONTEXTUALIZE_Q_PROMPT = ChatPromptTemplate.from_messages([
@@ -192,15 +250,7 @@ CONTEXTUALIZE_Q_PROMPT = ChatPromptTemplate.from_messages([
 
 def build_rag_chain(db: Chroma, model: str | None = None):
     """
-    Build and return a LangChain *retrieval chain* with conversation memory.
-
-    The chain:
-      1. Reformulates the user question using chat history (if any).
-      2. Embeds the standalone question locally.
-      3. Retrieves top-k relevant chunks from ChromaDB via MMR.
-      4. Stuffs them into the system prompt.
-      5. Sends the combined prompt to the OpenRouter LLM.
-      6. Returns ``{"answer": str, "context": list[Document]}``.
+    Build a retrieval chain with stable Full-Context Caching (Architecture A).
     """
     llm = get_llm(model=model)
     base_retriever = get_reranking_retriever(db)
@@ -210,16 +260,57 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         llm, base_retriever, CONTEXTUALIZE_Q_PROMPT
     )
 
+    # 🚀 CLAUDE-CODE GRADE ARCHITECTURE:
+    # We partition the system message into:
+    # 1. CORE_INSTRUCTIONS (Static/Cached)
+    # 2. FULL_SOURCE_CONTEXT (Static Prefix/Cached) - Pinning full files here.
+    # 3. RAG_CHUNKS (Dynamic/Uncached) - For everything else.
+    
+    system_blocks = [
+        {
+            "type": "text",
+            "text": CORE_INSTRUCTIONS,
+            # BP 1: Instructions (always cached)
+            "cache_control": {"type": "ephemeral"} if ENABLE_PROMPT_CACHING else None
+        },
+        {
+            "type": "text",
+            "text": "FULL SOURCE CONTEXT (PINNED):\n{full_source_context}",
+            # BP 2: The "Heavy Lifter" - Pinned files go here and stay warm!
+            "cache_control": {"type": "ephemeral"} if ENABLE_PROMPT_CACHING else None
+        },
+        {
+            "type": "text",
+            "text": "RETRIEVED RAG CHUNKS (DYNAMIC):\n{context}",
+            # No cache_control here because RAG chunks change every turn 
+            # and would break the prefix for the history below it.
+        }
+    ]
+
     prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT),
+        ("system", system_blocks),
         MessagesPlaceholder("chat_history"),
         ("human", "{input}"),
     ])
 
-    # "Stuff" all retrieved docs into the {context} placeholder
+    # Combine documents based on the prompt
     question_answer_chain = create_stuff_documents_chain(llm, prompt)
 
-    # Full retrieval chain: retrieve → stuff → generate
+    # Full retrieval chain
     rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
 
-    return rag_chain
+    def _full_context_cache_chain(inputs: dict):
+        """
+        Architecture A: Put the main code in the 'Pinned' prefix to 
+        ensure 100% cache hits on follow-up questions.
+        """
+        # Ensure full_source_context is at least a string
+        inputs["full_source_context"] = inputs.get("full_source_context", "None pinned.")
+        
+        # Inject history cache markers (BP 3 & 4)
+        inputs["chat_history"] = _prepare_history_with_cache(inputs.get("chat_history", []))
+        
+        return rag_chain.invoke(inputs)
+
+    from langchain_core.runnables import RunnableLambda
+    return RunnableLambda(_full_context_cache_chain)

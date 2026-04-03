@@ -20,6 +20,17 @@ OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
 GEMINI_MODEL: str = "google/gemini-2.0-flash-001"
 QWEN_MODEL: str = "qwen/qwen3.6-plus:free"
 
+# 🚀 PROMPT CACHING — Harnessing from Claude Code
+# The required beta header for Anthropic's prompt caching feature
+ANTHROPIC_CACHE_BETA_HEADER: str = "prompt-caching-2024-07-31"
+ENABLE_PROMPT_CACHING: bool = True
+
+# 🎯 CACHE TUNING — Gemini & Anthropic Optimisation
+# Gemini 2.0 Flash needs ~1028 tokens to trigger a cache write. 
+CACHE_THRESHOLD_TOKENS: int = 1028
+# Anthropic supports up to 4 breakpoints.
+MAX_CACHE_CHECKPOINTS: int = 4
+
 # ── Ollama (100 % local) ──────────────────────────────────────────────────
 OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODELS: list[str] = ["llama3.1", "llama3.2:1b", "qwen2.5:3b"]
@@ -50,6 +61,8 @@ CODE_EXTENSIONS: list[str] = [
     # Languages
     ".py", ".js", ".ts", ".jsx", ".tsx",
     ".java", ".cpp", ".c", ".h", ".go", ".rs", ".cs",
+    # Hardware Design (Verilog & SystemVerilog)
+    ".v", ".sv", 
     # Web / UI frameworks
     ".vue", ".svelte", ".html", ".css",
     # Config / markup
