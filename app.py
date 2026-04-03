@@ -387,7 +387,8 @@ if user_input:
                 stream_iter = chain.stream({
                     "input": user_input, 
                     "chat_history": lc_history,
-                    "full_source_context": st.session_state.pinned_content
+                    "full_source_context": st.session_state.pinned_content,
+                    "exclude_file": st.session_state.pinned_file  # 🚀 Smart exclusion filter
                 })
                 for chunk in stream_iter:
                     # Retrieval chain yields "context" first, then "answer" chunks
