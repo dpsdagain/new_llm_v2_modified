@@ -260,9 +260,9 @@ def build_rag_chain(db: Chroma, model: str | None = None):
     Build a retrieval chain with stable Full-Context Caching (Architecture A).
     """
     llm = get_llm(model=model)
-    # We will compute the retrievers dynamically in the call lambda 
-    # to support the Pinned File exclusion filter.
-    pass
+    # 🚀 Professional Polish: Dynamic Retrieval Configuration
+    # We build our retrievers inside the lambda to support the 
+    # Pinned File exclusion filter.
 
     # 🚀 CLAUDE-CODE GRADE ARCHITECTURE (OPTIMISED):
     # We partition the system message into frozen static blocks:
@@ -298,9 +298,6 @@ def build_rag_chain(db: Chroma, model: str | None = None):
     # Combine documents based on the prompt
     question_answer_chain = create_stuff_documents_chain(llm, prompt)
 
-    # Full retrieval chain
-    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
-
     def _full_context_cache_chain(inputs: dict):
         """
         Architecture A Polish: High-Efficiency RAG with Pre-flight Bypass
@@ -322,8 +319,13 @@ def build_rag_chain(db: Chroma, model: str | None = None):
             # Bypass! Send raw query to retriever
             docs = retriever.invoke(inputs["input"])
             inputs["context"] = docs
-            # Run the Q&A chain
-            yield from question_answer_chain.stream(inputs)
+            
+            # 🔥 Fix: app.py expects a dict with 'context' and 'answer'
+            yield {"context": docs}
+            
+            # Run the Q&A chain and yield correctly formatted answer chunks
+            for chunk in question_answer_chain.stream(inputs):
+                yield {"answer": chunk}
         else:
             # 2. History-Aware Retrieval (Follow-up turns)
             # Re-formulate question for accuracy in multi-turn chat
