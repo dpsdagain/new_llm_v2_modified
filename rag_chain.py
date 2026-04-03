@@ -260,11 +260,14 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         llm, base_retriever, CONTEXTUALIZE_Q_PROMPT
     )
 
-    # 🚀 CLAUDE-CODE GRADE ARCHITECTURE:
-    # We partition the system message into:
+    # 🚀 CLAUDE-CODE GRADE ARCHITECTURE (OPTIMISED):
+    # We partition the system message into frozen static blocks:
     # 1. CORE_INSTRUCTIONS (Static/Cached)
     # 2. FULL_SOURCE_CONTEXT (Static Prefix/Cached) - Pinning full files here.
-    # 3. RAG_CHUNKS (Dynamic/Uncached) - For everything else.
+    # 
+    # Chat History follows this (BP 3 & 4)
+    # The dynamic RAG context is moved to the VERY BOTTOM (Human Message)
+    # to avoid breaking the prefix for the history.
     
     system_blocks = [
         {
@@ -278,19 +281,14 @@ def build_rag_chain(db: Chroma, model: str | None = None):
             "text": "FULL SOURCE CONTEXT (PINNED):\n{full_source_context}",
             # BP 2: The "Heavy Lifter" - Pinned files go here and stay warm!
             "cache_control": {"type": "ephemeral"} if ENABLE_PROMPT_CACHING else None
-        },
-        {
-            "type": "text",
-            "text": "RETRIEVED RAG CHUNKS (DYNAMIC):\n{context}",
-            # No cache_control here because RAG chunks change every turn 
-            # and would break the prefix for the history below it.
         }
     ]
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_blocks),
         MessagesPlaceholder("chat_history"),
-        ("human", "{input}"),
+        # ✅ MOVED the dynamic RAG chunks to the very bottom, below the history!
+        ("human", "RETRIEVED RAG CHUNKS (DYNAMIC):\n{context}\n\nUser Question:\n{input}"),
     ])
 
     # Combine documents based on the prompt
@@ -310,7 +308,8 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         # Inject history cache markers (BP 3 & 4)
         inputs["chat_history"] = _prepare_history_with_cache(inputs.get("chat_history", []))
         
-        return rag_chain.invoke(inputs)
+        # ✅ YIELD the stream to restore the UI typewriter effect
+        yield from rag_chain.stream(inputs)
 
     from langchain_core.runnables import RunnableLambda
     return RunnableLambda(_full_context_cache_chain)
