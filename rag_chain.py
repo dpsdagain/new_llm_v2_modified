@@ -52,6 +52,42 @@ OLLAMA_PREFIX = "ollama:"
 #  LLM
 # ═══════════════════════════════════════════════════════════════════════════
 
+# 🚀 Professional Polish: Model Caching Capability Check
+def is_cache_capable(model: str | None) -> bool:
+    """
+    Check if the model/provider supports prompt caching blocks.
+    Explicitly returns False for local Ollama models.
+    """
+    if not model:
+        return False
+    if model.startswith(OLLAMA_PREFIX):
+        return False
+    
+    m_lower = model.lower()
+    # Supports Claude 3.5+, Gemini 2.0+, and DeepSeek on OpenRouter
+    return any(p in m_lower for p in ["claude-3-5", "claude-3-haiku", "gemini-2.0", "deepseek"])
+
+
+def format_message_content(text: str, model: str | None, use_cache: bool = False) -> str | list[dict]:
+    """
+    Return content as a plain string for non-cache models, 
+    or a block-list for cache-capable ones.
+    """
+    # If caching is globally disabled or model can't handle it, 
+    # always return a plain string.
+    if not ENABLE_PROMPT_CACHING or not use_cache or not is_cache_capable(model):
+        return text
+    
+    # Return Anthropic-style block format with cache markers
+    return [
+        {
+            "type": "text", 
+            "text": text, 
+            "cache_control": {"type": "ephemeral"}
+        }
+    ]
+
+
 def get_llm(
     model: str | None = None,
     temperature: float | None = None,
@@ -159,10 +195,13 @@ class ScoringCrossEncoderReranker(CrossEncoderReranker):
             top_docs.append(doc)
         
         # 🚀 ABSOLUTE DETERMINISM For Cache Stability
-        # Sorting by (source, content) ensures the prompt string is 
-        # mathematically identical even if the DB returns results 
-        # in a slightly different order across turns.
-        top_docs.sort(key=lambda d: (d.metadata.get("source", ""), d.page_content))
+        # We sort by (-round(score, 2), source, content).
+        # Rounding to 2 decimal places creates 'bins' of relevance,
+        # ensuring minor float jitter doesn't break the cache prefix,
+        # while the top-N results stay strictly at the top.
+        top_docs.sort(key=lambda d: (-round(float(d.metadata.get("reranker_score", 0)), 2), 
+                                     d.metadata.get("source", ""), 
+                                     d.page_content))
         return top_docs
 
 
@@ -197,46 +236,73 @@ INSTRUCTIONS:
    with clear explanations.
 """
 
-# 🚀 CONTEXT PROMPT (Dynamic/Uncached)
-CONTEXT_PROMPT = "RETRIEVED CONTEXT:\n{context}"
-
 # ═══════════════════════════════════════════════════════════════════════════
 #  HISTORY CACHING HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _prepare_history_with_cache(history: list[BaseMessage]) -> list[BaseMessage]:
+def _prepare_history_with_cache(history: list[BaseMessage], model: str | None) -> list[BaseMessage]:
     """
     Inject cache markers into the chat history based on the 4-breakpoint limit.
     BP 1 and 2 are used by the system instructions and context. 
     BP 3 and 4 are used here to keep history 'warm'.
     """
-    if not history or not ENABLE_PROMPT_CACHING or MAX_CACHE_CHECKPOINTS <= 2:
+    # 🚀 Professional Polish: Guard against non-cache models
+    if not history or not ENABLE_PROMPT_CACHING or MAX_CACHE_CHECKPOINTS <= 2 or not is_cache_capable(model):
         return history
 
     new_history = []
     # Identify indices for breakpoints (e.g., start of history and mid-point)
     # We target the 'content' block to add the cache_control marker.
     for i, msg in enumerate(history):
+        # With our Anchor pattern (Turn 0 is always index 0), 
+        # BP 3 at i==0 is incredibly stable.
         is_bp3 = (i == 0)
         is_bp4 = (len(history) > 6 and i == len(history) // 2)
 
-        if is_bp3 or is_bp4:
-            # Convert to list-of-dicts format for Anthropic/OpenRouter
-            content = [
-                {
-                    "type": "text", 
-                    "text": msg.content, 
-                    "cache_control": {"type": "ephemeral"}
-                }
-            ]
-        else:
-            content = msg.content
+        content = format_message_content(msg.content, model, use_cache=(is_bp3 or is_bp4))
 
         if isinstance(msg, HumanMessage):
             new_history.append(HumanMessage(content=content))
         else:
             new_history.append(AIMessage(content=content))
     return new_history
+
+# 🚀 Professional Polish: Linguistic Logic Gates (History vs Speed)
+import re
+STRICT_HISTORY_REGEX = re.compile(r"\b(above|previous|earlier|you said|you mentioned|as before|same as|go back)\b", re.IGNORECASE)
+PINNED_REF_REGEX = re.compile(r"\b(this file|the file|pinned file|the code|this code)\b", re.IGNORECASE)
+
+STOPWORDS = {
+    "the", "a", "is", "are", "do", "does", "what", "how", "why", "where", "when", 
+    "which", "can", "will", "should", "my", "your", "i", "it", "this", "that", 
+    "in", "on", "for", "to", "of", "and", "or", "with", "from", "about", "has", 
+    "have", "been", "not", "just", "any"
+}
+
+def is_pinned_content_relevant(query: str, content: str) -> bool:
+    """
+    Safety-First Relevance Gate: Determine if the pinned file should be included.
+    Uses size threshold, regex matches, and a fast keyword scanner.
+    """
+    # 1. Size Threshold: Files under ~3k tokens (12k chars) are always included.
+    if len(content) < 12000:
+        return True
+    
+    # 2. Explicit Reference: User mentioned 'this file' or similar.
+    if PINNED_REF_REGEX.search(query):
+        return True
+    
+    # 3. Keyword Overlap: Fast scanner on the first 100 lines.
+    q_tokens = {t.lower() for t in re.split(r"\W+", query) if t.lower() not in STOPWORDS and len(t) > 1}
+    # Scan only a representative sample of the file for speed
+    sample_content = "\n".join(content.splitlines()[:100])
+    f_tokens = {t.lower() for t in re.split(r"\W+", sample_content)}
+    
+    if q_tokens & f_tokens:
+        return True
+        
+    return False
+
 
 # ── Prompt used to reformulate follow-up questions into standalone ones ────
 CONTEXTUALIZE_Q_PROMPT = ChatPromptTemplate.from_messages([
@@ -251,94 +317,97 @@ CONTEXTUALIZE_Q_PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  RAG CHAIN
-# ═══════════════════════════════════════════════════════════════════════════
-
 def build_rag_chain(db: Chroma, model: str | None = None):
     """
     Build a retrieval chain with stable Full-Context Caching (Architecture A).
     """
     llm = get_llm(model=model)
+    
     # 🚀 Professional Polish: Dynamic Retrieval Configuration
     # We build our retrievers inside the lambda to support the 
     # Pinned File exclusion filter.
 
-    # 🚀 CLAUDE-CODE GRADE ARCHITECTURE (OPTIMISED):
-    # We partition the system message into frozen static blocks:
-    # 1. CORE_INSTRUCTIONS (Static/Cached)
-    # 2. FULL_SOURCE_CONTEXT (Static Prefix/Cached) - Pinning full files here.
-    # 
-    # Chat History follows this (BP 3 & 4)
-    # The dynamic RAG context is moved to the VERY BOTTOM (Human Message)
-    # to avoid breaking the prefix for the history.
+    # 🚀 Professional Polish: Dual-Path Prompt Construction
+    # Non-cache models (Gemini/Qwen/Ollama) get a clean string.
+    # Cache-capable models (Claude) get the structured block list.
     
-    system_blocks = [
-        {
-            "type": "text",
-            "text": CORE_INSTRUCTIONS,
-            # BP 1: Instructions (always cached)
-            "cache_control": {"type": "ephemeral"} if ENABLE_PROMPT_CACHING else None
-        },
-        {
-            "type": "text",
-            "text": "FULL SOURCE CONTEXT (PINNED):\n{full_source_context}",
-            # BP 2: The "Heavy Lifter" - Pinned files go here and stay warm!
-            "cache_control": {"type": "ephemeral"} if ENABLE_PROMPT_CACHING else None
-        }
-    ]
+    is_cc = is_cache_capable(model) and ENABLE_PROMPT_CACHING
+    
+    if is_cc:
+        system_blocks = [
+            format_message_content(CORE_INSTRUCTIONS, model, use_cache=True)[0],
+            format_message_content("FULL SOURCE CONTEXT (PINNED):\n{full_source_context}", model, use_cache=True)[0]
+        ]
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_blocks),
+            MessagesPlaceholder("chat_history"),
+            ("human", "RETRIEVED RAG CHUNKS (DYNAMIC):\n{context}\n\nUser Question:\n{input}"),
+        ])
+    else:
+        # Fallback to plain-string system prompt for maximum reliability
+        system_text = f"{CORE_INSTRUCTIONS}\n\nFULL SOURCE CONTEXT (PINNED):\n{{full_source_context}}"
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_text),
+            MessagesPlaceholder("chat_history"),
+            ("human", "RETRIEVED RAG CHUNKS (DYNAMIC):\n{context}\n\nUser Question:\n{input}"),
+        ])
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_blocks),
-        MessagesPlaceholder("chat_history"),
-        # ✅ MOVED the dynamic RAG chunks to the very bottom, below the history!
-        ("human", "RETRIEVED RAG CHUNKS (DYNAMIC):\n{context}\n\nUser Question:\n{input}"),
-    ])
-
-    # Combine documents based on the prompt
     question_answer_chain = create_stuff_documents_chain(llm, prompt)
 
     def _full_context_cache_chain(inputs: dict):
         """
-        Architecture A Polish: High-Efficiency RAG with Pre-flight Bypass
-        and Smart Document Exclusion.
+        Architecture Industrial Core: High-Efficiency logic with
+        Linguistic Logic Gates and Safety-First Relevance Gating.
         """
-        # Ensure full_source_context is at least a string
-        inputs["full_source_context"] = inputs.get("full_source_context", "None pinned.")
-        
-        # 1. 🚀 Turn 1 Pre-flight Bypass (Refined)
-        # Skip reformulated question LLM call if history is empty.
-        # This saves ~1.5s of latency on the first turn.
+        user_input = inputs["input"]
+        pinned_content = inputs.get("full_source_context", "")
         history = inputs.get("chat_history", [])
-        pinned_file = inputs.get("exclude_file") # Passed from app.py
         
-        # Build a fresh retriever (incredibly fast) to apply filters
-        retriever = get_reranking_retriever(db, exclude_file=pinned_file)
+        # 1. 🛡️ Safety-First Relevance Gate
+        # Decide if the pinned file is worth the token cost for this turn.
+        if pinned_content and pinned_content != "None pinned.":
+            if not is_pinned_content_relevant(user_input, pinned_content):
+                inputs["full_source_context"] = "[Large pinned file omitted for token efficiency. Ask about it specifically to re-enable.]"
+        else:
+            inputs["full_source_context"] = "None pinned."
+
+        # 2. 🚀 Linguistic Logic Gate (Turn 1 & Smart Bypass)
+        # Priority: Accuracy (History match) > Speed (Pinned match) > Default Bypass (fresh conversation).
+        skip_reformulation = False
         
         if not history:
-            # Bypass! Send raw query to retriever
-            docs = retriever.invoke(inputs["input"])
+            skip_reformulation = True
+        elif STRICT_HISTORY_REGEX.search(user_input):
+            skip_reformulation = False
+        elif PINNED_REF_REGEX.search(user_input):
+            skip_reformulation = True
+        elif len(history) <= 6:
+            # 🚀 Tier 1 Refinement: Raised threshold to 6 messages (3 full turns)
+            # for better speed in medium-length conversational bursts.
+            skip_reformulation = True
+
+        pinned_file = inputs.get("exclude_file")
+        retriever = get_reranking_retriever(db, exclude_file=pinned_file)
+        
+        if skip_reformulation:
+            # 🚀 Tier 1 Refinement: Semantic Retrieval Caching support
+            # Use pre-fetched docs from app.py if available to skip DB search
+            docs = inputs.get("cached_docs")
+            if not docs:
+                docs = retriever.invoke(user_input)
+            
             inputs["context"] = docs
-            
-            # 🔥 Fix: app.py expects a dict with 'context' and 'answer'
+            # Normalise history format with model-awareness
+            inputs["chat_history"] = _prepare_history_with_cache(history, model)
             yield {"context": docs}
-            
-            # Run the Q&A chain and yield correctly formatted answer chunks
             for chunk in question_answer_chain.stream(inputs):
                 yield {"answer": chunk}
         else:
-            # 2. History-Aware Retrieval (Follow-up turns)
-            # Re-formulate question for accuracy in multi-turn chat
             history_aware_retriever = create_history_aware_retriever(
                 llm, retriever, CONTEXTUALIZE_Q_PROMPT
             )
-            # Combine everything in the full retrieval chain
             full_rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
-            
-            # Inject history cache markers (BP 3 & 4)
-            inputs["chat_history"] = _prepare_history_with_cache(history)
-            
-            # ✅ YIELD the stream to restore the UI typewriter effect
+            inputs["chat_history"] = _prepare_history_with_cache(history, model)
             yield from full_rag_chain.stream(inputs)
 
     from langchain_core.runnables import RunnableLambda
