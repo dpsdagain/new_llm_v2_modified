@@ -8,6 +8,7 @@ Run with:
 from __future__ import annotations
 
 import os
+import re
 import numpy as np
 import streamlit as st
 
@@ -129,6 +130,38 @@ if "last_query_vector" not in st.session_state:
     st.session_state.last_query_vector = None
 if "last_docs" not in st.session_state:
     st.session_state.last_docs = []
+if "cache_stats" not in st.session_state:
+    st.session_state.cache_stats = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def detect_force_retrieval(query: str, collection_name: str | None) -> bool:
+    """
+    Detect if the user is explicitly forcing a refresh or mentioning a specific file.
+    """
+    force_words = ["refresh", "reload", "force", "update", "latest", "re-retrieve"]
+    if any(word in query.lower() for word in force_words):
+        return True
+    
+    if not collection_name:
+        return False
+        
+    # Check for file mentions
+    try:
+        info = get_collection_info(collection_name)
+        sources = [os.path.basename(s).lower() for s in info.get("sources", [])]
+        query_lower = query.lower()
+        # Look for any filename in the query (simple word match)
+        for src in sources:
+            if src in query_lower:
+                return True
+    except Exception:
+        pass
+        
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -381,6 +414,7 @@ if user_input:
                 )
             st.stop()
         try:
+            st.session_state.vector_db = db  # 🚀 Fix: Persist DB for embedding access
             st.session_state.rag_chain = build_rag_chain(db, model=st.session_state.model_id)
         except ValueError as e:
             with st.chat_message("assistant"):
@@ -404,26 +438,53 @@ if user_input:
             full_response = {"answer": "", "context": []}
 
             def response_generator():
-                # 🚀 Platinum Standard: High-Precision Semantic Router
-                # Uses 0.85 Cosine Similarity to reuse docs without accuracy loss.
+                # 🚀 Accuracy-First: HYBRID INTENT GUARD
+                # Detect if we should FORCE a refresh regardless of similarity
+                is_forced = detect_force_retrieval(user_input, st.session_state.active_collection)
+                
                 cached_docs = None
                 q_vector = None
                 
-                if st.session_state.vector_db:
+                if st.session_state.vector_db and not is_forced:
                     # 1. Embed query
                     q_vector = st.session_state.vector_db.embeddings.embed_query(user_input)
                     
-                    # 2. Check for cache hit (Precision Threshold: 0.85)
-                    if st.session_state.last_query_vector is not None:
+                    # 2. 🚀 PLATINUM SLIDING WINDOW: Union Retrieval
+                    # We always retrieve fresh docs and merge them with previous context
+                    # to maintain a stable cached prefix while adding new info.
+                    if st.session_state.last_query_vector is not None and st.session_state.last_docs:
                         sim = np.dot(q_vector, st.session_state.last_query_vector)
-                        if sim >= 0.85:
-                            cached_docs = st.session_state.last_docs
+                        
+                        # Only attempt Union if we have some semantic overlap
+                        if sim >= 0.70:
+                            from config import RERANKER_TOP_N
+                            # Perform new retrieval
+                            fresh_docs = st.session_state.vector_db.similarity_search(user_input, k=RERANKER_TOP_N)
+                            
+                            # Intersection: Docs present in both (Stable Prefix)
+                            last_content = [d.page_content for d in st.session_state.last_docs]
+                            intersection = [d for d in st.session_state.last_docs if d.page_content in [f.page_content for f in fresh_docs]]
+                            
+                            # New Chunks: Unique docs from fresh search
+                            new_chunks = [f for f in fresh_docs if f.page_content not in last_content]
+                            
+                            # Construct Union: Intersection first (Cache Stability) + New Chunks
+                            stable_docs = intersection
+                            new_docs = new_chunks[: (RERANKER_TOP_N * 2) - len(intersection)]
+                            
+                            cached_docs = {"stable": stable_docs, "new": new_docs}
+                            
+                            if intersection:
+                                st.toast(f"Reusing {len(intersection)} stable chunks", icon="♻️")
                 
-                # 🚀 Anchor-based History Window
+                # 🚀 Accuracy-First: GHOST HISTORY
                 if len(lc_history) <= 10:
                     truncated_history = lc_history
                 else:
-                    truncated_history = lc_history[:2] + lc_history[-8:]
+                    anchor = lc_history[:2]
+                    ghosts = [msg for msg in lc_history[2:-8] if isinstance(msg, HumanMessage)]
+                    window = lc_history[-8:]
+                    truncated_history = anchor + ghosts + window
                 
                 stream_iter = chain.stream({
                     "input": user_input, 
@@ -434,9 +495,19 @@ if user_input:
                 })
 
                 for chunk in stream_iter:
+                    # Extract cache metadata if available (OpenRouter/Anthropic)
+                    if hasattr(chunk, "response_metadata") and chunk.response_metadata:
+                        meta = chunk.response_metadata
+                        cache_read = meta.get("anthropic-ratelimit-input-tokens-cache-read")
+                        cache_create = meta.get("anthropic-ratelimit-input-tokens-cache-creation")
+                        if cache_read or cache_create:
+                            st.session_state.cache_stats = {
+                                "read": cache_read,
+                                "created": cache_create
+                            }
+
                     if "context" in chunk:
                         full_response["context"] = chunk["context"]
-                        # 🚀 Store the retrieved docs for the next turn
                         st.session_state.last_docs = chunk["context"]
                         st.session_state.last_query_vector = q_vector
                     if "answer" in chunk:
@@ -451,9 +522,15 @@ if user_input:
             st.error(f"❌ LLM error: {e}")
             st.stop()
 
-        # Show source documents
+        # Show source documents and Cache Stats
         source_docs = result.get("context", [])
         sources_meta = []
+        
+        # 🚀 Cache Usage Transparency
+        if st.session_state.get("cache_stats"):
+            stats = st.session_state.cache_stats
+            st.caption(f"⚡ Cache: **{stats.get('read', 0)}** read | **{stats.get('created', 0)}** created")
+
         if source_docs:
             with st.expander("📚 Source Documents"):
                 for i, doc in enumerate(source_docs, 1):

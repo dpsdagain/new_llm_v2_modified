@@ -1,0 +1,52 @@
+# Walkthrough - Prompt Caching Implementation
+
+I have successfully implemented **Prompt Caching** in the `new_llm_v2` project. This optimization "harnesses" the same boundary pattern used in the Claude Code codebase to reduce API costs and latency.
+
+## Changes Made
+
+### 1. Configuration Constants
+In [config.py](file:///c:/Users/CHip/OneDrive%20-%20Chipspirit%20Technologies%20Private%20Limited/Desktop/AM/24/SPI/anti_gravity/anthropic-leaked-source-code-main/new_llm_v3/new_llm_v2/config.py), I added the necessary constants to enable the feature:
+- `ANTHROPIC_CACHE_BETA_HEADER`: The beta header required by Anthropic's API (`prompt-caching-2024-07-31`).
+- `ENABLE_PROMPT_CACHING`: A toggle to turn the feature on or off.
+
+### 2. Header Injection
+In [rag_chain.py](file:///c:/Users/CHip/OneDrive%20-%20Chipspirit%20Technologies%20Private%20Limited/Desktop/AM/24/SPI%20/anti_gravity/anthropic-leaked-source-code-main/new_llm_v3/new_llm_v2/rag_chain.py), the `get_llm` function now includes the `anthropic-beta` header in every call to OpenRouter.
+
+### 3. Partitioned System Prompt
+The core of the optimization is in how the prompt is structured. I refactored the single `SYSTEM_PROMPT` into a multi-block structure:
+
+| Block Type | Content | Caching Status |
+| :--- | :--- | :--- |
+| **Static (CORE)** | AI instructions, persona, and rules. | **Cached** (`ephemeral`) |
+| **Dynamic (CONTEXT)** | The retrieved code/PDF chunks (`{context}`). | **Uncached** |
+
+This ensures that the "Rules" are only processed once per session, while the "Data" is processed fresh as needed.
+
+## Technical Details
+
+The new `build_rag_chain` logic uses a structured `SystemMessage` compatible with LangChain and OpenRouter:
+
+```python
+system_message = {
+    "role": "system",
+    "content": [
+        {
+            "type": "text",
+            "text": CORE_INSTRUCTIONS,
+            "cache_control": {"type": "ephemeral"} # The "Locker" marker
+        },
+        {
+            "type": "text",
+            "text": CONTEXT_PROMPT # The dynamic context {context}
+        }
+    ]
+}
+```
+
+## Expected Results
+- **Cost Reduction:** Up to **90% savings** on the instruction tokens after the first turn.
+- **Improved Latency:** Faster "First Token" response time in long-running chats.
+- **Graceful Failure:** If a model doesn't support caching, these tags are safely ignored.
+
+> [!TIP]
+> To see the best results, use `anthropic/claude-3.5-sonnet` as your model in the sidebar!

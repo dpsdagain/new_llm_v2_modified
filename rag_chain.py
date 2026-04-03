@@ -254,8 +254,7 @@ def _prepare_history_with_cache(history: list[BaseMessage], model: str | None) -
     # We target the 'content' block to add the cache_control marker.
     for i, msg in enumerate(history):
         # 🚀 Final Zero-Gaps: Exactly 4 Breakpoints 
-        # (1:Instructions, 2:Pinned, 3:RAG, 4:History Start)
-        # We keep only the START of the window cached to ensure BP4 limit.
+        # (1:Instructions, 2:Pinned, 3:Stable RAG, 4:History Start)
         is_history_start = (i == 0)
         content = format_message_content(msg.content, model, use_cache=is_history_start)
 
@@ -294,9 +293,10 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         system_blocks = [
             format_message_content(CORE_INSTRUCTIONS, model, use_cache=True)[0],
             format_message_content("FULL SOURCE CONTEXT (PINNED):\n{full_source_context}", model, use_cache=True)[0],
-            # 🚀 Tier 2 Refinement: Context block is now part of the stable System prefix.
-            # We place it ABOVE the chat history to ensure the RAG knowledge is cached.
-            format_message_content("RETRIEVED RAG CHUNKS (DYNAMIC):\n{context}", model, use_cache=True)[0]
+            # 🚀 BP 3: Stable Context (Intersection)
+            format_message_content("STABLE RAG CHUNKS (CACHED):\n{stable_context}", model, use_cache=True)[0],
+            # 🚀 NO BP: Dynamic Context (New Unique Chunks)
+            {"type": "text", "text": "NEW RAG CHUNKS (DYNAMIC):\n{new_context}"}
         ]
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_blocks),
@@ -305,7 +305,12 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         ])
     else:
         # Fallback to plain-string system prompt for maximum reliability
-        system_text = f"{CORE_INSTRUCTIONS}\n\nFULL SOURCE CONTEXT (PINNED):\n{{full_source_context}}\n\nRETRIEVED RAG CHUNKS (DYNAMIC):\n{{context}}"
+        system_text = (
+            f"{CORE_INSTRUCTIONS}\n\n"
+            "FULL SOURCE CONTEXT (PINNED):\n{full_source_context}\n\n"
+            "STABLE RAG CHUNKS:\n{stable_context}\n\n"
+            "NEW RAG CHUNKS:\n{new_context}"
+        )
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_text),
             MessagesPlaceholder("chat_history"),
@@ -328,31 +333,43 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         inputs["full_source_context"] = pinned_content if (pinned_content and pinned_content != "None pinned.") else "None pinned."
 
         # 2. 🚀 Platinum Logic: Unified Zero-Waste Path
-
-        # 🚀 Zero-Waste Retrieval
-        docs = inputs.get("cached_docs")
-        if not docs:
-            # 🌊 Zero-Token Contextual Search
-            # Instead of a pre-flight LLM call, we enrich the search signal
-            # by prepending the human's last query to current input.
+        cached_input = inputs.get("cached_docs")
+        
+        stable_docs = []
+        new_docs = []
+        
+        if isinstance(cached_input, dict):
+            # 🚀 Split Context Path
+            stable_docs = cached_input.get("stable", [])
+            new_docs = cached_input.get("new", [])
+        elif cached_input:
+            # Fallback for old list format
+            stable_docs = cached_input
+        else:
+            # 🚀 No cache provided, perform fresh retrieval
             search_signal = user_input
             if history:
                 prev_human = history[-1].content if hasattr(history[-1], 'content') else ""
-                # 🛡️ DILUTION GUARD: Only enrichment the search signal if the 
-                # previous message was technical (> 15 chars) or the 
-                # current query is a shorthand (< 10 chars).
                 if len(prev_human) > 15 or len(user_input) < 10:
                     search_signal = f"{prev_human}\n{user_input}"
             
             pinned_file = inputs.get("exclude_file")
             retriever = get_reranking_retriever(db, exclude_file=pinned_file)
-            docs = retriever.invoke(search_signal)
+            new_docs = retriever.invoke(search_signal)
         
-        inputs["context"] = docs
+        def _format_docs(docs):
+            return "\n\n".join([f"SOURCE: {d.metadata.get('source')}\nCONTENT: {d.page_content}" for d in docs]) if docs else "None."
+
+        inputs["stable_context"] = _format_docs(stable_docs)
+        inputs["new_context"] = _format_docs(new_docs)
+        
+        # Keep internal context list for metadata
+        inputs["context"] = stable_docs + new_docs
+        
         # Normalise history format with model-awareness
         inputs["chat_history"] = _prepare_history_with_cache(history, model)
         
-        yield {"context": docs}
+        yield {"context": inputs["context"]}
         for chunk in question_answer_chain.stream(inputs):
             yield {"answer": chunk}
 
