@@ -549,27 +549,36 @@ class AgenticRouter:
             return "Error generating summary."
 
 
-def _sort_docs_deterministically(docs: list[Document]) -> list[Document]:
+def _sort_docs_deterministically(
+    docs: list[Document],
+    stable_hashes: set[str] | None = None,
+) -> list[Document]:
     """
-    Absolute Zero-Gaps Sorting. Ensures that even if similarity
-    scores are identical, the prompt string remains stable to satisfy
-    provider-side prompt caching (Anthropic/Gemini).
+    Prefix-Preserving Deterministic Sort.
 
-    Uses content_hash (SHA-256) as the primary tie-breaker — it is
-    unique per chunk and cheaper to compare than full page_content.
-    Full page_content is the final fallback for chunks missing a hash.
+    When *stable_hashes* is provided (the content hashes of docs that were
+    already in the prompt on the previous turn), those docs sort FIRST
+    (``_is_new=0``), preserving the exact byte prefix that the provider
+    cache (Anthropic/Gemini) already stored.  New docs sort AFTER
+    (``_is_new=1``) so they append to the end of the block without
+    breaking the cached prefix.
+
+    Within each group the order is fully deterministic:
+    ``(source, chunk_index, content_hash, page_content)``.
     """
-    return sorted(
-        docs,
-        key=lambda d: (
+    def _sort_key(d):
+        is_new = 0 if (
+            stable_hashes
+            and d.metadata.get("content_hash", "") in stable_hashes
+        ) else (1 if stable_hashes else 0)
+        return (
+            is_new,
             str(d.metadata.get("source", "")),
             int(d.metadata.get("chunk_index", 0)),
             str(d.metadata.get("content_hash", "")),
-            # Full content as absolute tie-breaker (not truncated)
-            # to guarantee byte-level prefix determinism for provider cache
-            str(d.page_content)
+            str(d.page_content),
         )
-    )
+    return sorted(docs, key=_sort_key)
 
 
 def calculate_cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
@@ -603,18 +612,33 @@ def build_rag_chain(db: Chroma, model: str | None = None):
     max_bp, _ = get_cache_profile(model)
 
     if is_cc:
-        # 🚀 Prefix Stability: Reordered Static -> Dynamic
-        # 1. Core Instructions (Most Stable)
-        # 2. Pinned Context (Stable per Session)
-        # 3. Stable RAG (Stable per turn)
-        # 4. Sentinel State (Dynamic every 5 turns)
-        system_blocks = [
-            format_message_content(CORE_INSTRUCTIONS, model, use_cache=True)[0],
-            format_message_content("FULL SOURCE CONTEXT (PINNED):\n{full_source_context}", model, use_cache=True)[0],
-            format_message_content("STABLE RAG CONTEXT (DETERMINISTIC):\n{stable_context}", model, use_cache=True)[0],
-            format_message_content("CONVERSATION STATE:\n{sentinel_state}", model, use_cache=True)[0],
+        # 🚀 Dynamic Cache Blocks — driven by provider profile
+        # Ordered from most stable to most volatile.  We only attach
+        # cache_control markers to the first ``max_bp`` blocks; the
+        # rest are plain text (no wasted cache writes).
+        #
+        # Claude (max_bp=4):  all 4 blocks cached
+        # Gemini (max_bp=8):  all 4 cached (headroom for future splits)
+        # Model w/ 2 bp:      only Instructions + Pinned get markers
+        block_specs = [
+            # (label/template, most stable first)
+            CORE_INSTRUCTIONS,
+            "FULL SOURCE CONTEXT (PINNED):\n{full_source_context}",
+            "STABLE RAG CONTEXT (DETERMINISTIC):\n{stable_context}",
+            "CONVERSATION STATE:\n{sentinel_state}",
         ]
-        
+        system_blocks = []
+        for idx, text in enumerate(block_specs):
+            use_cache_marker = idx < max_bp  # only mark up to max_bp blocks
+            formatted = format_message_content(text, model, use_cache=use_cache_marker)
+            # format_message_content returns a list for cache-capable models
+            if isinstance(formatted, list):
+                system_blocks.append(formatted[0])
+            else:
+                # Plain string — wrap in the Anthropic text-block format
+                # so the system_blocks list stays homogeneous.
+                system_blocks.append({"type": "text", "text": formatted})
+
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_blocks),
             MessagesPlaceholder("chat_history"),
@@ -697,45 +721,23 @@ def build_rag_chain(db: Chroma, model: str | None = None):
             and not TRUST_NATIVE_CACHE
         )
         
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            # Only classify if not a semantic hit
-            intent_future = None
-            if not is_semantic_hit:
-                intent_future = executor.submit(router.classify_intent, user_input, history)
-            
-            # Conditionally summarize state
-            summary_future = None
-            if should_summarize:
-                summary_future = executor.submit(router.summarize_state, history)
-            
-            # Await results
-            intent = intent_future.result() if intent_future else "FOLLOW-UP"
-            if summary_future:
-                inputs["sentinel_state"] = summary_future.result()
-            else:
-                inputs["sentinel_state"] = existing_sentinel
-        
         # 3. Pinned context passthrough with Relevance Gate
         from config import PINNED_RELEVANCE_THRESHOLD
-        
+
         pinned_eligible = False
         if pinned_content and pinned_content != "None pinned.":
-            # If we have a query embedding, check similarity
             if current_emb:
-                # Use cached pinned embedding — only recomputed when
-                # the pinned file changes, not on every turn.
                 pinned_emb = _get_pinned_embedding(pinned_content)
                 pinned_sim = calculate_cosine_similarity(current_emb, pinned_emb)
                 if pinned_sim >= PINNED_RELEVANCE_THRESHOLD:
                     pinned_eligible = True
             else:
-                # No embedding yet (first turn, or local), default to True
                 pinned_eligible = True
 
         inputs["full_source_context"] = pinned_content if pinned_eligible else "None pinned (irrelevant to current query)."
 
-        # 4. Retrieval path (Semantic Caching Upgrade)
-        cached_input = inputs.get("cached_docs") # Previous context_union
+        # 4. Retrieval path — with Speculative Execution
+        cached_input = inputs.get("cached_docs")
         previous_union = []
         if cached_input:
             if isinstance(cached_input, dict):
@@ -744,33 +746,82 @@ def build_rag_chain(db: Chroma, model: str | None = None):
                 previous_union = cached_input
 
         new_retrievals = []
-        
+
         # 🚀 PERFORMANCE: Skip retrieval if semantic hit
         if is_semantic_hit and previous_union:
             final_docs = previous_union
-            intent = "SEMANTIC-HIT" 
+            intent = "SEMANTIC-HIT"
         else:
-            if db:
-                pinned_file = inputs.get("exclude_file")
-                ext_filter = inputs.get("filter_extensions")
-                
-                # Use 'rewrite_query' only if similarity is low to save cycles
-                search_signal = user_input
-                if intent == "FOLLOW-UP" and history and current_similarity < 0.6:
-                    search_signal = router.rewrite_query(user_input, history)
-                
-                # Reuse the query embedding we already computed for the
-                # semantic-similarity check so ChromaDB does not re-embed
-                # the same string a second time.
-                search_emb = current_emb if (search_signal == user_input and current_emb) else None
+            pinned_file = inputs.get("exclude_file")
+            ext_filter = inputs.get("filter_extensions")
+
+            # ── Speculative Execution ──────────────────────────────────────
+            # Run hybrid_search CONCURRENTLY with classify_intent so the
+            # 1–3 s local LLM latency is completely masked.
+            # The speculative search uses the original user_input.
+            # If the router later decides to rewrite the query (rare:
+            # FOLLOW-UP + similarity < 0.6), we discard the speculative
+            # result and re-search with the rewritten query.
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                # A. Intent classification (local LLM)
+                intent_future = None
+                if not is_semantic_hit:
+                    intent_future = executor.submit(
+                        router.classify_intent, user_input, history,
+                    )
+
+                # B. Sentinel summarisation (local LLM, conditional)
+                summary_future = None
+                if should_summarize:
+                    summary_future = executor.submit(
+                        router.summarize_state, history,
+                    )
+
+                # C. Speculative hybrid search (ChromaDB + BM25)
+                speculative_future = None
+                if db and not is_semantic_hit:
+                    search_emb = current_emb  # reuse pre-computed embedding
+                    speculative_future = executor.submit(
+                        hybrid_search,
+                        db, user_input,
+                        collection_name=coll_name,
+                        k=RETRIEVER_K,
+                        exclude_file=pinned_file,
+                        filter_extensions=ext_filter,
+                        query_embedding=search_emb,
+                    )
+
+                # Await results
+                intent = intent_future.result() if intent_future else "FOLLOW-UP"
+                if summary_future:
+                    inputs["sentinel_state"] = summary_future.result()
+                else:
+                    inputs["sentinel_state"] = existing_sentinel
+
+                speculative_docs = (
+                    speculative_future.result() if speculative_future else []
+                )
+
+            # ── Post-Speculation Decision ──────────────────────────────────
+            # If a query rewrite is needed, the speculative results are
+            # based on the wrong query string — discard and re-search.
+            needs_rewrite = (
+                intent == "FOLLOW-UP"
+                and history
+                and current_similarity < 0.6
+            )
+            if needs_rewrite and db:
+                rewritten = router.rewrite_query(user_input, history)
                 new_retrievals = hybrid_search(
-                    db, search_signal,
+                    db, rewritten,
                     collection_name=coll_name,
                     k=RETRIEVER_K,
                     exclude_file=pinned_file,
                     filter_extensions=ext_filter,
-                    query_embedding=search_emb,
+                    # Can't reuse embedding — query string changed
                 )
+            else:
+                new_retrievals = speculative_docs
 
             # 🤖 Intent-Aware Union Logic
             if intent == "FOLLOW-UP":
@@ -782,12 +833,22 @@ def build_rag_chain(db: Chroma, model: str | None = None):
                     if h not in seen_hashes:
                         unique_docs.append(d)
                         seen_hashes.add(h)
-                final_docs = unique_docs if len(unique_docs) <= MAX_CONTEXT_UNION else unique_docs[-MAX_CONTEXT_UNION:]
+                final_docs = (
+                    unique_docs
+                    if len(unique_docs) <= MAX_CONTEXT_UNION
+                    else unique_docs[-MAX_CONTEXT_UNION:]
+                )
             else:
                 final_docs = new_retrievals
 
-        # 🚀 Platinum Sorting: Ensures exact prompt match for backend cache
-        sorted_docs = _sort_docs_deterministically(final_docs)
+        # 🚀 Prefix-Preserving Sort: stable docs stay at top, new docs append.
+        # This keeps the stable_context byte prefix identical across turns
+        # so the provider-side cache (Anthropic/Gemini) gets a hit.
+        stable_hashes = {
+            d.metadata.get("content_hash", "")
+            for d in previous_union
+        } if previous_union and intent == "FOLLOW-UP" else None
+        sorted_docs = _sort_docs_deterministically(final_docs, stable_hashes=stable_hashes)
         
         def _format_docs(docs):
             return "\n\n".join([f"SOURCE: {d.metadata.get('source')}\nCONTENT: {d.page_content}" for d in docs]) if docs else "None."
