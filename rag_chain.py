@@ -45,6 +45,9 @@ from config import (
     VECTOR_WEIGHT,
 )
 
+# 🚀 Platinum Scaling: Context Window Limits
+MAX_CONTEXT_UNION = 15
+
 from langchain_core.messages import (
     HumanMessage,
     AIMessage,
@@ -515,6 +518,21 @@ class AgenticRouter:
             return "Error generating summary."
 
 
+def _sort_docs_deterministically(docs: list[Document]) -> list[Document]:
+    """
+    Absolute Zero-Gaps Sorting. Ensures that even if similarity
+    scores are identical, the prompt string remains stable to satisfy
+    provider-side prompt caching (Anthropic/Gemini).
+    """
+    return sorted(
+        docs,
+        key=lambda d: (
+            str(d.metadata.get("source", "")),
+            int(d.metadata.get("chunk_index", 0)),
+            str(d.metadata.get("content_hash", ""))
+        )
+    )
+
 def build_rag_chain(db: Chroma, model: str | None = None):
     """
     Build a retrieval chain with stable Full-Context Caching (Architecture A).
@@ -538,23 +556,22 @@ def build_rag_chain(db: Chroma, model: str | None = None):
             format_message_content(CORE_INSTRUCTIONS, model, use_cache=True)[0],
             format_message_content("CONVERSATION STATE:\n{sentinel_state}", model, use_cache=True)[0],
             format_message_content("FULL SOURCE CONTEXT (PINNED):\n{full_source_context}", model, use_cache=True)[0],
-            format_message_content("STABLE RAG CHUNKS (CACHED):\n{stable_context}", model, use_cache=True)[0],
+            format_message_content("STABLE RAG CONTEXT (DETERMINISTIC):\n{stable_context}", model, use_cache=True)[0],
         ]
-        # Use remaining breakpoints for dynamic context (no cache marker)
-        system_blocks.append({"type": "text", "text": "NEW RAG CHUNKS (DYNAMIC):\n{new_context}"})
-
+        
+        # 🚀 Prefix Stability: chat_history must come AFTER the stable cache blocks
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_blocks),
             MessagesPlaceholder("chat_history"),
             ("human", "{input}"),
         ])
     else:
+        # For non-cache models, we still keep the same logical order
         system_text = (
             f"{CORE_INSTRUCTIONS}\n\n"
             "CONVERSATION STATE:\n{sentinel_state}\n\n"
             "FULL SOURCE CONTEXT (PINNED):\n{full_source_context}\n\n"
-            "STABLE RAG CHUNKS:\n{stable_context}\n\n"
-            "NEW RAG CHUNKS:\n{new_context}"
+            "STABLE RAG CONTEXT (DETERMINISTIC):\n{stable_context}"
         )
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_text),
@@ -606,45 +623,62 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         # 3. Pinned context passthrough
         inputs["full_source_context"] = pinned_content if (pinned_content and pinned_content != "None pinned.") else "None pinned."
 
-        # 4. Retrieval path
-        cached_input = inputs.get("cached_docs")
+        # 4. Retrieval path (Always Query to prevent Hallucination Trap)
+        cached_input = inputs.get("cached_docs") # This is the context_union from app.py
         
-        stable_docs = []
-        new_docs = []
-        
-        # Use existing cache if intent is FOLLOW-UP and cache exists
-        if intent == "FOLLOW-UP" and cached_input:
+        previous_union = []
+        if cached_input:
             if isinstance(cached_input, dict):
-                stable_docs = cached_input.get("stable", [])
-                new_docs = cached_input.get("new", [])
+                # Legacy support for stable/new split
+                previous_union = cached_input.get("stable", []) + cached_input.get("new", [])
             else:
-                stable_docs = cached_input
+                previous_union = cached_input
+
+        # Fresh retrieval with Agentic Rewriting
+        new_retrievals = []
+        if db:
+            search_signal = router.rewrite_query(user_input, history) if intent == "FOLLOW-UP" else user_input
+            pinned_file = inputs.get("exclude_file")
+            ext_filter = inputs.get("filter_extensions")
+            
+            new_retrievals = hybrid_search(
+                db, search_signal,
+                collection_name=coll_name,
+                k=RETRIEVER_K,
+                exclude_file=pinned_file,
+                filter_extensions=ext_filter,
+            )
+
+        # 🤖 Intent-Aware Union Logic
+        if intent == "FOLLOW-UP":
+            # Combine new and old docs
+            combined = previous_union + new_retrievals
+            # Deduplicate by content_hash to prevent bloat
+            seen_hashes = set()
+            unique_docs = []
+            for d in combined:
+                h = d.metadata.get("content_hash", d.page_content)
+                if h not in seen_hashes:
+                    unique_docs.append(d)
+                    seen_hashes.add(h)
+            
+            # 🚀 Bloat Guard: Cap context union size
+            # We keep the newest retrievals first if we have to drop
+            final_docs = unique_docs if len(unique_docs) <= MAX_CONTEXT_UNION else unique_docs[-MAX_CONTEXT_UNION:]
         else:
-            # Fresh retrieval: Use Agentic Rewriting for precise search signal
-            if db:
-                search_signal = router.rewrite_query(user_input, history) if intent == "FOLLOW-UP" else user_input
-                pinned_file = inputs.get("exclude_file")
-                ext_filter = inputs.get("filter_extensions")
-                
-                # Use hybrid search (BM25 + vector) for better precision
-                new_docs = hybrid_search(
-                    db, search_signal,
-                    collection_name=coll_name,
-                    k=RETRIEVER_K,
-                    exclude_file=pinned_file,
-                    filter_extensions=ext_filter,
-                )
-            else:
-                new_docs = []
+            # NEW intent: Flush history and use only latest results
+            final_docs = new_retrievals
+
+        # 🚀 Platinum Sorting: Ensures exact prompt match for backend cache
+        sorted_docs = _sort_docs_deterministically(final_docs)
         
         def _format_docs(docs):
             return "\n\n".join([f"SOURCE: {d.metadata.get('source')}\nCONTENT: {d.page_content}" for d in docs]) if docs else "None."
 
-        inputs["stable_context"] = _format_docs(stable_docs)
-        inputs["new_context"] = _format_docs(new_docs)
+        inputs["stable_context"] = _format_docs(sorted_docs)
         
-        # Keep internal context list for metadata
-        inputs["context"] = stable_docs + new_docs
+        # Keep internal context list for metadata and next-turn caching
+        inputs["context"] = sorted_docs
         
         # Normalise history format with model-awareness
         inputs["chat_history"] = _prepare_history_with_cache(history, model)

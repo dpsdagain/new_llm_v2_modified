@@ -131,8 +131,6 @@ if "pinned_content" not in st.session_state:
 if "vector_db" not in st.session_state:
     st.session_state.vector_db = None
 # 🚀 Platinum Standard: Semantic Retrieval Cache State
-if "last_query_vector" not in st.session_state:
-    st.session_state.last_query_vector = None
 if "last_docs" not in st.session_state:
     st.session_state.last_docs = []
 if "token_usage" not in st.session_state:
@@ -282,15 +280,7 @@ def detect_force_retrieval(query: str, collection_name: str | None) -> bool:
     return False
 
 
-def get_dynamic_threshold(query_text: str) -> float:
-    """
-    Return a similarity threshold based on the query complexity.
-    Short queries (e.g., 'Why?') need higher precision (0.85).
-    """
-    words = query_text.split()
-    if len(words) < 4:
-        return 0.85 # Strict precision for ambiguous follow-ups
-    return 0.70 # Default semantic flexibility
+# 🚀 Side Effect: Removed get_dynamic_threshold (Replaced by Backend Union Retrieval)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -349,8 +339,7 @@ with st.sidebar:
     if new_model_id != st.session_state.model_id:
         st.session_state.model_id = new_model_id
         st.session_state.rag_chain = None
-        # 🚀 Invalidation: Model change clears the precision cache
-        st.session_state.last_query_vector = None
+        # 🚀 Invalidation: Model change clears context
         st.session_state.last_docs = []
         st.toast(f"Switched to model: {st.session_state.model_id}", icon="🤖")
 
@@ -483,7 +472,6 @@ with st.sidebar:
                 st.session_state.active_collection = chosen
                 st.session_state.rag_chain = None
                 # 🚀 Invalidation: Switching collections clears context
-                st.session_state.last_query_vector = None
                 st.session_state.last_docs = []
                 st.success(f"Connected to **{chosen}**")
         with col2:
@@ -515,7 +503,6 @@ with st.sidebar:
     if st.button("🗑️ Clear Chat", use_container_width=True):
         st.session_state.chat_history = []
         st.session_state.sentinel_state = ""
-        st.session_state.last_query_vector = None
         st.session_state.last_docs = []
         st.rerun()
 
@@ -606,7 +593,6 @@ if st.session_state.ingestion_task:
         st.success(f"✅ **Ingestion Complete!** Added **{added}** new chunks.")
         st.session_state.active_collection = task.collection_name
         st.session_state.rag_chain = None
-        st.session_state.last_query_vector = None
         st.session_state.last_docs = []
         st.session_state.ingestion_done_processed = True
         # Keep success message visible for a bit
@@ -683,23 +669,9 @@ if user_input:
             st.session_state.token_usage = {}
 
             def response_generator():
-                cached_docs = None
-                # Check for semantic similarity to skip retrieval (UI side)
-                # Note: The backend AgenticRouter also does its own logic, 
-                # but we keep this for the 'Instant UI Response' if sim is very high.
-                if st.session_state.get("vector_db") and st.session_state.last_query_vector is not None:
-                    try:
-                        q_vector = st.session_state.vector_db.embeddings.embed_query(user_input)
-                        sim = np.dot(q_vector, st.session_state.last_query_vector)
-                        
-                        # 🚀 Professional Polish: Dynamic Thresholding
-                        threshold = get_dynamic_threshold(user_input)
-                        
-                        if sim >= threshold:
-                            cached_docs = {"stable": st.session_state.last_docs, "new": []}
-                            st.toast(f"Cache hit (sim={sim:.2f}) — reusing previous context", icon="⚡")
-                    except Exception:
-                        pass
+                # 🚀 Native-First Cache: We always retrieve context to prevent hallucinations.
+                # The backend handles union, deduplication, and deterministic sorting.
+                cached_docs = st.session_state.get("last_docs", [])
 
                 pinned_to_send = st.session_state.get("pinned_content", "None pinned.")
                 

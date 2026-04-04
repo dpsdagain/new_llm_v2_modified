@@ -147,7 +147,13 @@ def load_and_chunk_pdf(file_path: str) -> list[Document]:
     loader = PyPDFLoader(file_path)
     raw_docs = loader.load()
     splitter = _get_splitter(chunk_size_override=PDF_CHUNK_SIZE)
-    return splitter.split_documents(raw_docs)
+    chunks = splitter.split_documents(raw_docs)
+    
+    # Enrich metadata for cache-stable sorting
+    for i, chunk in enumerate(chunks):
+        chunk.metadata["chunk_index"] = i
+        chunk.metadata["content_hash"] = _content_hash(chunk)
+    return chunks
 
 
 def load_and_chunk_pdf_upload(uploaded_file: BinaryIO, filename: str) -> list[Document]:
@@ -226,10 +232,12 @@ def load_and_chunk_codebase(
         splitter = _get_splitter(ext, chunk_size_override=CODE_CHUNK_SIZE)
         chunks = splitter.split_documents(raw_docs)
 
-        # Enrich metadata so retriever can cite sources
-        for chunk in chunks:
+        # Enrich metadata for citation and cache-stable sorting
+        for i, chunk in enumerate(chunks):
             chunk.metadata["source_type"] = "code"
             chunk.metadata["file_extension"] = ext
+            chunk.metadata["chunk_index"] = i
+            chunk.metadata["content_hash"] = _content_hash(chunk)
         all_chunks.extend(chunks)
 
     return all_chunks
