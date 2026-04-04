@@ -149,6 +149,10 @@ if "ingestion_task" not in st.session_state:
 if "ingestion_done_processed" not in st.session_state:
     st.session_state.ingestion_done_processed = False
 if "sentinel_state" not in st.session_state:
+    st.session_state.sentinel_state = "No summary generated yet."
+if "sentinel_future" not in st.session_state:
+    st.session_state.sentinel_future = None
+if "sentinel_state" not in st.session_state:
     st.session_state.sentinel_state = ""
 if "filter_extensions" not in st.session_state:
     st.session_state.filter_extensions = []
@@ -724,6 +728,18 @@ if user_input:
 
     chain = st.session_state.rag_chain
 
+    # 🚀 Architectural Overhaul: Update sentinel state from background thread
+    if st.session_state.get("sentinel_future") and st.session_state.sentinel_future.done():
+        try:
+            new_state = st.session_state.sentinel_future.result()
+            if new_state:
+                st.session_state.sentinel_state = new_state
+                if st.session_state.get("debug_mode"):
+                    st.toast("✅ Sentinel Summary Updated (Background)", icon="🤖")
+        except Exception as e:
+            st.error(f"Sentinel background error: {e}")
+        st.session_state.sentinel_future = None
+
     # ── Build LangChain-format chat history ───────────────────────────────
     lc_history = []
     for msg in st.session_state.chat_history[:-1]:  # exclude current user msg
@@ -822,6 +838,10 @@ if user_input:
                     # Phase 5: Capture re-rank score
                     if "top_relevance_score" in chunk:
                         st.session_state.last_relevance_score = chunk["top_relevance_score"]
+                    
+                    # 🚀 Architectural Overhaul: Capture background sentinel future
+                    if "sentinel_future" in chunk and chunk["sentinel_future"]:
+                        st.session_state.sentinel_future = chunk["sentinel_future"]
 
                 # POST-STREAM USAGE FETCH
                 if generation_id and not st.session_state.token_usage.get("input") and not st.session_state.model_id.startswith(OLLAMA_PREFIX):

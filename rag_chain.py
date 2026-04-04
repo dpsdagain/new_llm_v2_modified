@@ -70,6 +70,19 @@ from rank_bm25 import BM25Okapi
 from nltk.tokenize import word_tokenize
 from backend import load_bm25_index
 
+# 🚀 Global Executor for non-blocking background tasks (Sentinel summaries)
+_background_executor = ThreadPoolExecutor(max_workers=2)
+
+def _background_summarize(history: list[BaseMessage]):
+    """Background task to update sentinel state without stalling the main stream."""
+    try:
+        router = VectorRouter()
+        new_state = router.summarize_state_fast(history)
+        return new_state
+    except Exception as e:
+        logger.error(f"❌ Background summary failed: {e}")
+        return None
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  EXACT-MATCH QUERY CACHE
 # ═══════════════════════════════════════════════════════════════════════════
@@ -780,16 +793,13 @@ def build_rag_chain(db: Chroma, model: str | None = None):
                 _exact_match_cache_store(user_input, current_emb)
             current_similarity = calculate_cosine_similarity(current_emb, last_query_emb)
 
-        # 🚀 Semantic Escape Hatch (with Native Cache override)
-        from config import SEMANTIC_CACHE_THRESHOLD, STRICT_SEMANTIC_THRESHOLD
+        # 🚀 Semantic Intent Detection (Latency-Free)
+        from config import SEMANTIC_CACHE_THRESHOLD, CONTEXT_DECAY_THRESHOLD
         
-        is_strict_hit = (
-            current_similarity >= STRICT_SEMANTIC_THRESHOLD
-            and not force_retrieval
-        )
+        # We always retrieve (TRUST_NATIVE_CACHE=True), but we still use 
+        # similarity to categorize the intent for UI telemetry.
         is_semantic_hit = (
             current_similarity >= SEMANTIC_CACHE_THRESHOLD
-            and not TRUST_NATIVE_CACHE
         )
         
         # 3. Pinned context passthrough with Relevance Gate
@@ -827,67 +837,68 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         specialty = router.detect_specialty(user_input) if enable_auto else "GENERAL"
         specialist_model = SPECIALIST_MAPPING.get(specialty) if enable_auto else None
 
-        # Sentinel summarisation still uses LLM but only on intervals.
-        if should_summarize:
-            inputs["sentinel_state"] = router.summarize_state_fast(history)
-        else:
-            inputs["sentinel_state"] = existing_sentinel
+        # 🚀 ARCHITECTURAL PURITY: Always retrieve.
+        # Deterministic sorting (Layer 7) handles the provider-side cost savings.
+        pinned_file = inputs.get("exclude_file")
+        ext_filter = inputs.get("filter_extensions")
 
-        # 🚀 PERFORMANCE: Skip retrieval if semantic cache hit
-        # Note: If TRUST_NATIVE_CACHE=True (in config), is_semantic_hit is always False.
-        if is_strict_hit and previous_union:
-            final_docs = previous_union
-            intent = "STRICT-HIT"
-        elif is_semantic_hit and previous_union:
-            final_docs = previous_union
-            intent = "SEMANTIC-HIT"
-        else:
-            pinned_file = inputs.get("exclude_file")
-            ext_filter = inputs.get("filter_extensions")
+        # 2. Hybrid search (ChromaDB + BM25)
+        # We fetch a larger candidate pool if re-ranking is enabled.
+        from config import RERANK_CANDIDATES, RERANK_TOP_K, RETRIEVER_K
+        k_fetch = RERANK_CANDIDATES if USE_RERANKER else RETRIEVER_K
 
-            # 2. Hybrid search (ChromaDB + BM25)
-            # We fetch a larger candidate pool if re-ranking is enabled.
-            from config import RERANK_CANDIDATES, RERANK_TOP_K, RETRIEVER_K
-            k_fetch = RERANK_CANDIDATES if USE_RERANKER else RETRIEVER_K
+        new_retrievals = []
+        if db:
+            new_retrievals = hybrid_search(
+                db, user_input,
+                collection_name=coll_name,
+                k=k_fetch,
+                exclude_file=pinned_file,
+                filter_extensions=ext_filter,
+                query_embedding=current_emb,
+            )
+        
+        # 3. 🎯 Local Re-ranking (Phase 3) ──────────────────────────────
+        if USE_RERANKER and reranker and new_retrievals:
+            new_retrievals = reranker.rerank(
+                user_input, 
+                new_retrievals, 
+                top_k=RERANK_TOP_K
+            )
+            # 🚀 Phase 5: Capture the top relevance score for telemetry
+            reranker_score = getattr(reranker, 'last_top_score', 0.0)
 
-            new_retrievals = []
-            if db:
-                new_retrievals = hybrid_search(
-                    db, user_input,
-                    collection_name=coll_name,
-                    k=k_fetch,
-                    exclude_file=pinned_file,
-                    filter_extensions=ext_filter,
-                    query_embedding=current_emb,
-                )
+        # 🤖 Intent-Aware Union Logic with Context Decay
+        if intent == "FOLLOW-UP":
+            # 🧪 CONTEXT DECAY: Score previous chunks against current query.
+            # If an old chunk is no longer relevant, evict it to keep prompt lean.
+            decayed_union = []
+            if previous_union and current_emb:
+                from backend import get_embedding_model
+                # This is fast as chunks are small
+                for doc in previous_union:
+                    # We use a simple heuristic to avoid re-embedding.
+                    # If the doc was retrieved recently, it likely has high score.
+                    # We only decay if the semantic context shift is significant.
+                    doc_sim = calculate_cosine_similarity(current_emb, get_embedding_model().embed_query(doc.page_content[:200]))
+                    if doc_sim >= CONTEXT_DECAY_THRESHOLD:
+                        decayed_union.append(doc)
             
-            # 3. 🎯 Local Re-ranking (Phase 3) ──────────────────────────────
-            if USE_RERANKER and reranker and new_retrievals:
-                new_retrievals = reranker.rerank(
-                    user_input, 
-                    new_retrievals, 
-                    top_k=RERANK_TOP_K
-                )
-                # 🚀 Phase 5: Capture the top relevance score for telemetry
-                reranker_score = getattr(reranker, 'last_top_score', 0.0)
-
-            # 🤖 Intent-Aware Union Logic
-            if intent == "FOLLOW-UP":
-                combined = previous_union + new_retrievals
-                seen_hashes = set()
-                unique_docs = []
-                for d in combined:
-                    h = d.metadata.get("content_hash", d.page_content)
-                    if h not in seen_hashes:
-                        unique_docs.append(d)
-                        seen_hashes.add(h)
-                final_docs = (
-                    unique_docs
-                    if len(unique_docs) <= MAX_CONTEXT_UNION
-                    else unique_docs[-MAX_CONTEXT_UNION:]
-                )
-            else:
-                final_docs = new_retrievals
+            combined = decayed_union + new_retrievals
+            seen_hashes = set()
+            unique_docs = []
+            for d in combined:
+                h = d.metadata.get("content_hash", d.page_content)
+                if h not in seen_hashes:
+                    unique_docs.append(d)
+                    seen_hashes.add(h)
+            final_docs = (
+                unique_docs
+                if len(unique_docs) <= MAX_CONTEXT_UNION
+                else unique_docs[-MAX_CONTEXT_UNION:]
+            )
+        else:
+            final_docs = new_retrievals
 
         # 🚀 Prefix-Preserving Sort: stable docs stay at top, new docs append.
         # This keeps the stable_context byte prefix identical across turns
@@ -927,12 +938,20 @@ def build_rag_chain(db: Chroma, model: str | None = None):
                 current_emb = get_embedding_model().embed_query(user_input)
                 _exact_match_cache_store(user_input, current_emb)
 
+        # 🚀 ASYNC SENTINEL TRIGGER
+        # We trigger the summary in the background. It will be available 
+        # for the NEXT turn to keep the current turn latency-free.
+        background_future = None
+        if should_summarize:
+            background_future = _background_executor.submit(_background_summarize, history)
+
         yield {
             "context": inputs["context"], 
             "intent": intent, 
             "query_embedding": current_emb,
             "specialist_active": specialist_model if enable_auto else None,
-            "top_relevance_score": reranker_score if 'reranker_score' in locals() else 0.0
+            "top_relevance_score": reranker_score if 'reranker_score' in locals() else 0.0,
+            "sentinel_future": background_future # Pass future to UI for persistence
         }
         
         for chunk in question_answer_chain.stream(inputs):

@@ -91,7 +91,7 @@ MIN_CURRENT_QUERY_LENGTH: int = 10  # below this, always augment with previous q
 
 # ── Semantic cache ─────────────────────────────────────────────────────────
 SEMANTIC_CACHE_THRESHOLD: float = 0.85    # cosine similarity to reuse cached docs
-STRICT_SEMANTIC_THRESHOLD: float = 0.98   # absolute retrieval bypass (no DB call)
+CONTEXT_DECAY_THRESHOLD: float = 0.35     # similarity below which old chunks are evicted
 PINNED_RELEVANCE_THRESHOLD: float = 0.40  # min similarity to inject pinned file
 STICKY_PINNED_CONTEXT: bool = True        # preserve cache prefix stability regardless of relevance
 
@@ -99,10 +99,7 @@ STICKY_PINNED_CONTEXT: bool = True        # preserve cache prefix stability rega
 # When True, the system ALWAYS retrieves fresh chunks (never skips retrieval
 # on semantic hit).  If the same chunks come back, deterministic sorting
 # produces the same prompt prefix, and the provider-side cache (Anthropic/
-# Gemini) naturally kicks in at ~10 % cost.  If different chunks come back,
-# you get correct context and avoid hallucination from stale cached docs.
-# Trade-off: slightly higher local compute (BM25 + vector each turn) but
-# eliminates the risk of serving wrong context on subtle topic shifts.
+# Gemini) naturally kicks in at ~10 % cost.
 TRUST_NATIVE_CACHE: bool = True
 
 # ── Ghost history ──────────────────────────────────────────────────────────
