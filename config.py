@@ -65,6 +65,7 @@ CHUNK_SIZE: int = 1000          # characters per chunk (default fallback)
 CHUNK_OVERLAP: int = 200        # overlap between chunks
 CODE_CHUNK_SIZE: int = 500      # smaller chunks for dense code
 PDF_CHUNK_SIZE: int = 1500      # larger chunks for prose documents
+ZERO_CHUNK_THRESHOLD: int = 200000 # files smaller than this (chars) aren't chunked
 
 # ── ChromaDB ────────────────────────────────────────────────────────────────
 CHROMA_DB_DIR: str = os.path.join(os.path.dirname(__file__), "chroma_db")
@@ -80,7 +81,7 @@ MIN_PREV_QUERY_LENGTH: int = 15   # min length of previous query to include in s
 MIN_CURRENT_QUERY_LENGTH: int = 10  # below this, always augment with previous query
 
 # ── Semantic cache ─────────────────────────────────────────────────────────
-SEMANTIC_CACHE_THRESHOLD: float = 0.70    # cosine similarity to reuse cached docs
+SEMANTIC_CACHE_THRESHOLD: float = 0.85    # cosine similarity to reuse cached docs
 PINNED_RELEVANCE_THRESHOLD: float = 0.40  # min similarity to inject pinned file
 
 # ── Ghost history ──────────────────────────────────────────────────────────

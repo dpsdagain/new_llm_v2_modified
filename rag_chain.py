@@ -529,9 +529,24 @@ def _sort_docs_deterministically(docs: list[Document]) -> list[Document]:
         key=lambda d: (
             str(d.metadata.get("source", "")),
             int(d.metadata.get("chunk_index", 0)),
-            str(d.metadata.get("content_hash", ""))
+            str(d.metadata.get("content_hash", "")),
+            # 🚀 Absolute Tie-Breaker: Sort by content subset to guarantee determinism
+            str(d.page_content)[:100]
         )
     )
+
+
+def calculate_cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
+    """Calculate cosine similarity between two embedding vectors."""
+    if not vec1 or not vec2:
+        return 0.0
+    v1 = np.array(vec1)
+    v2 = np.array(vec2)
+    norm1 = np.linalg.norm(v1)
+    norm2 = np.linalg.norm(v2)
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    return float(np.dot(v1, v2) / (norm1 * norm2))
 
 def build_rag_chain(db: Chroma, model: str | None = None):
     """
@@ -596,6 +611,10 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         pinned_content = inputs.get("full_source_context", "")
         history = inputs.get("chat_history", [])
         coll_name = inputs.get("collection_name", "default")
+        
+        # 🚀 Fix: Get last query and its embedding from inputs
+        last_query_emb = inputs.get("last_query_embedding")
+        force_retrieval = inputs.get("force_retrieval", False)
 
         # 1. 🤖 Parallel Agentic Orchestration ──────────────────────────────
         # We run classification and summarization (if needed) concurrently
@@ -604,9 +623,22 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         turn_count = sum(1 for m in history if isinstance(m, HumanMessage))
         should_summarize = (turn_count > 0 and turn_count % SENTINEL_INTERVAL == 0)
 
+        # Calculate semantic similarity to last query
+        current_similarity = 0.0
+        current_emb = None
+        if last_query_emb and not force_retrieval:
+            from backend import get_embedding_model
+            current_emb = get_embedding_model().embed_query(user_input)
+            current_similarity = calculate_cosine_similarity(current_emb, last_query_emb)
+
+        # 🚀 Semantic Escape Hatch: If similarity is very high, skip agentic routing
+        is_semantic_hit = current_similarity >= SEMANTIC_CACHE_THRESHOLD
+        
         with ThreadPoolExecutor(max_workers=2) as executor:
-            # Always classify intent
-            intent_future = executor.submit(router.classify_intent, user_input, history)
+            # Only classify if not a semantic hit
+            intent_future = None
+            if not is_semantic_hit:
+                intent_future = executor.submit(router.classify_intent, user_input, history)
             
             # Conditionally summarize state
             summary_future = None
@@ -614,7 +646,7 @@ def build_rag_chain(db: Chroma, model: str | None = None):
                 summary_future = executor.submit(router.summarize_state, history)
             
             # Await results
-            intent = intent_future.result()
+            intent = intent_future.result() if intent_future else "FOLLOW-UP"
             if summary_future:
                 inputs["sentinel_state"] = summary_future.result()
             else:
@@ -623,56 +655,52 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         # 3. Pinned context passthrough
         inputs["full_source_context"] = pinned_content if (pinned_content and pinned_content != "None pinned.") else "None pinned."
 
-        # 4. Retrieval path (Always Query to prevent Hallucination Trap)
+        # 4. Retrieval path (Semantic Caching Upgrade)
         cached_input = inputs.get("cached_docs") # Previous context_union
-        
         previous_union = []
         if cached_input:
             if isinstance(cached_input, dict):
-                # Legacy support for stable/new split
                 previous_union = cached_input.get("stable", []) + cached_input.get("new", [])
             else:
                 previous_union = cached_input
 
-        # 🚀 Latency Optimization: If history is empty, it's definitely a NEW topic
-        # Otherwise, check the rewritter only if needed.
         new_retrievals = []
-        if db:
-            pinned_file = inputs.get("exclude_file")
-            ext_filter = inputs.get("filter_extensions")
-            
-            # Use 'rewrite_query' only for follow-ups to save local LLM cycles
-            search_signal = user_input
-            if intent == "FOLLOW-UP" and history:
-                search_signal = router.rewrite_query(user_input, history)
-            
-            new_retrievals = hybrid_search(
-                db, search_signal,
-                collection_name=coll_name,
-                k=RETRIEVER_K,
-                exclude_file=pinned_file,
-                filter_extensions=ext_filter,
-            )
-
-        # 🤖 Intent-Aware Union Logic
-        if intent == "FOLLOW-UP":
-            # Combine new and old docs
-            combined = previous_union + new_retrievals
-            # Deduplicate by content_hash to prevent bloat
-            seen_hashes = set()
-            unique_docs = []
-            for d in combined:
-                h = d.metadata.get("content_hash", d.page_content)
-                if h not in seen_hashes:
-                    unique_docs.append(d)
-                    seen_hashes.add(h)
-            
-            # 🚀 Bloat Guard: Cap context union size
-            # We keep the newest retrievals first if we have to drop
-            final_docs = unique_docs if len(unique_docs) <= MAX_CONTEXT_UNION else unique_docs[-MAX_CONTEXT_UNION:]
+        
+        # 🚀 PERFORMANCE: Skip retrieval if semantic hit
+        if is_semantic_hit and previous_union:
+            final_docs = previous_union
+            intent = "SEMANTIC-HIT" 
         else:
-            # NEW intent: Flush history and use only latest results
-            final_docs = new_retrievals
+            if db:
+                pinned_file = inputs.get("exclude_file")
+                ext_filter = inputs.get("filter_extensions")
+                
+                # Use 'rewrite_query' only if similarity is low to save cycles
+                search_signal = user_input
+                if intent == "FOLLOW-UP" and history and current_similarity < 0.6:
+                    search_signal = router.rewrite_query(user_input, history)
+                
+                new_retrievals = hybrid_search(
+                    db, search_signal,
+                    collection_name=coll_name,
+                    k=RETRIEVER_K,
+                    exclude_file=pinned_file,
+                    filter_extensions=ext_filter,
+                )
+
+            # 🤖 Intent-Aware Union Logic
+            if intent == "FOLLOW-UP":
+                combined = previous_union + new_retrievals
+                seen_hashes = set()
+                unique_docs = []
+                for d in combined:
+                    h = d.metadata.get("content_hash", d.page_content)
+                    if h not in seen_hashes:
+                        unique_docs.append(d)
+                        seen_hashes.add(h)
+                final_docs = unique_docs if len(unique_docs) <= MAX_CONTEXT_UNION else unique_docs[-MAX_CONTEXT_UNION:]
+            else:
+                final_docs = new_retrievals
 
         # 🚀 Platinum Sorting: Ensures exact prompt match for backend cache
         sorted_docs = _sort_docs_deterministically(final_docs)
@@ -681,16 +709,16 @@ def build_rag_chain(db: Chroma, model: str | None = None):
             return "\n\n".join([f"SOURCE: {d.metadata.get('source')}\nCONTENT: {d.page_content}" for d in docs]) if docs else "None."
 
         inputs["stable_context"] = _format_docs(sorted_docs)
-        
-        # Keep internal context list for metadata and next-turn caching
         inputs["context"] = sorted_docs
-        
-        # Normalise history format with model-awareness
         inputs["chat_history"] = _prepare_history_with_cache(history, model)
         
-        yield {"context": inputs["context"], "intent": intent}
+        # Pass current embedding back to app for next turn tracking
+        if current_emb is None and is_semantic_hit:
+            current_emb = last_query_emb
+
+        yield {"context": inputs["context"], "intent": intent, "query_embedding": current_emb}
+        
         for chunk in question_answer_chain.stream(inputs):
-            # Extract content string while preserving the raw chunk for metadata (caching)
             content = chunk.content if hasattr(chunk, "content") else str(chunk)
             yield {"answer": content, "raw_chunk": chunk}
 

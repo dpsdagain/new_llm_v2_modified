@@ -49,6 +49,7 @@ from config import (
     CHROMA_DB_DIR,
     CODE_EXTENSIONS,
     EXCLUDED_FILE_PATTERNS,
+    ZERO_CHUNK_THRESHOLD,
 )
 
 
@@ -146,6 +147,22 @@ def load_and_chunk_pdf(file_path: str) -> list[Document]:
     """Load a PDF and split it into overlapping text chunks."""
     loader = PyPDFLoader(file_path)
     raw_docs = loader.load()
+    
+    # ── Zero Chunking (Phase 3 Upgrade) ──────────────────────────────
+    total_content = "\n".join([d.page_content for d in raw_docs])
+    if len(total_content) < ZERO_CHUNK_THRESHOLD:
+        # Create a single merged document
+        merged_doc = Document(
+            page_content=total_content,
+            metadata={
+                "source": file_path,
+                "zero_chunk": True,
+                "chunk_index": 0,
+                "content_hash": hashlib.sha256(total_content.encode("utf-8")).hexdigest()
+            }
+        )
+        return [merged_doc]
+
     splitter = _get_splitter(chunk_size_override=PDF_CHUNK_SIZE)
     chunks = splitter.split_documents(raw_docs)
     
@@ -225,8 +242,27 @@ def load_and_chunk_codebase(
         try:
             loader = TextLoader(fpath, autodetect_encoding=True)
             raw_docs = loader.load()
+            if not raw_docs:
+                continue
+            content = raw_docs[0].page_content
         except Exception as exc:
             logger.warning("Skipping %s: %s", fpath, exc)
+            continue
+
+        # ── Zero Chunking (Phase 3 Upgrade) ──────────────────────────────
+        if len(content) < ZERO_CHUNK_THRESHOLD:
+            chunk = Document(
+                page_content=content,
+                metadata={
+                    "source": fpath,
+                    "source_type": "code",
+                    "file_extension": ext,
+                    "zero_chunk": True,
+                    "chunk_index": 0,
+                    "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest()
+                }
+            )
+            all_chunks.append(chunk)
             continue
 
         splitter = _get_splitter(ext, chunk_size_override=CODE_CHUNK_SIZE)

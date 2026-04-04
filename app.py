@@ -135,6 +135,8 @@ if "last_docs" not in st.session_state:
     st.session_state.last_docs = []
 if "token_usage" not in st.session_state:
     st.session_state.token_usage = {}
+if "last_query_embedding" not in st.session_state:
+    st.session_state.last_query_embedding = None
 if "debug_mode" not in st.session_state:
     st.session_state.debug_mode = False
 if "ingestion_task" not in st.session_state:
@@ -504,6 +506,7 @@ with st.sidebar:
         st.session_state.chat_history = []
         st.session_state.sentinel_state = ""
         st.session_state.last_docs = []
+        st.session_state.last_query_embedding = None
         st.rerun()
 
     st.divider()
@@ -672,6 +675,8 @@ if user_input:
                 # 🚀 Native-First Cache: We always retrieve context to prevent hallucinations.
                 # The backend handles union, deduplication, and deterministic sorting.
                 cached_docs = st.session_state.get("last_docs", [])
+                last_emb = st.session_state.get("last_query_embedding")
+                is_forced = detect_force_retrieval(user_input, st.session_state.active_collection)
 
                 pinned_to_send = st.session_state.get("pinned_content", "None pinned.")
                 
@@ -690,6 +695,8 @@ if user_input:
                     "full_source_context": pinned_to_send,
                     "exclude_file": st.session_state.get("pinned_file"),
                     "cached_docs": cached_docs,
+                    "last_query_embedding": last_emb,
+                    "force_retrieval": is_forced,
                     "collection_name": st.session_state.active_collection or "default",
                     "sentinel_state": st.session_state.sentinel_state,
                     "filter_extensions": st.session_state.filter_extensions or None,
@@ -702,8 +709,13 @@ if user_input:
                         intent = chunk["intent"]
                         if intent == "FOLLOW-UP":
                             st.toast("Local LLM: Contextual Refinement 🤖", icon="🧠")
+                        elif intent == "SEMANTIC-HIT":
+                            st.toast("⚡ Semantic Cache Hit: Reusing Context", icon="🔥")
                         else:
                             st.toast("Local LLM: New Concept Detected 🤖", icon="✨")
+
+                    if "query_embedding" in chunk:
+                        st.session_state.last_query_embedding = chunk["query_embedding"]
 
                     if "context" in chunk:
                         full_response["context"] = chunk["context"]
