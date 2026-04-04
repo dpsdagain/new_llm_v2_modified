@@ -15,10 +15,19 @@ import hashlib
 import logging
 import os
 import tempfile
+import pickle
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import BinaryIO, Callable
+
+from rank_bm25 import BM25Okapi
+import nltk
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
+from nltk.tokenize import word_tokenize
 
 logger = logging.getLogger(__name__)
 
@@ -275,7 +284,60 @@ def ingest_into_chroma(
         persist_directory=CHROMA_DB_DIR,
         collection_name=collection_name,
     )
+    
+    # 🚀 Platinum Upgrade: Build Hybrid BM25 Index
+    _update_bm25_index(documents, collection_name)
+    
     return db, len(documents)
+
+
+def _get_bm25_path(collection_name: str) -> str:
+    """Return the filesystem path for the BM25 index pickle."""
+    return os.path.join(CHROMA_DB_DIR, f"{collection_name}_bm25.pkl")
+
+
+def _update_bm25_index(new_docs: list[Document], collection_name: str):
+    """
+    Build or update the BM25 index on disk. 
+    Note: For simplicity in this demo, we rebuild from all docs in the collection.
+    """
+    db = load_existing_chroma(collection_name)
+    if not db:
+        return
+        
+    all_data = db.get()
+    all_docs = []
+    for content, meta in zip(all_data.get("documents", []), all_data.get("metadatas", [])):
+        all_docs.append(Document(page_content=content, metadata=meta))
+    
+    if not all_docs:
+        return
+
+    # Tokenize for BM25
+    tokenized_corpus = [word_tokenize(doc.page_content.lower()) for doc in all_docs]
+    bm25 = BM25Okapi(tokenized_corpus)
+    
+    # Save index and the document map (we need to return the same docs)
+    payload = {
+        "bm25": bm25,
+        "docs": all_docs
+    }
+    
+    with open(_get_bm25_path(collection_name), "wb") as f:
+        pickle.dump(payload, f)
+
+
+def load_bm25_index(collection_name: str):
+    """Load the BM25 index from disk."""
+    path = _get_bm25_path(collection_name)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception as e:
+        logger.error(f"Failed to load BM25 index: {e}")
+        return None
 
 
 def load_existing_chroma(collection_name: str = "default") -> Chroma | None:
@@ -353,44 +415,74 @@ def delete_collection(collection_name: str) -> bool:
 
 class AsyncIngestionTask:
     """
-    Run ingestion (chunking + embedding) in a background thread
+    Run ingestion (loading, chunking, and embedding) in a background thread
     so the Streamlit UI stays responsive.
-
-    Usage:
-        task = AsyncIngestionTask(chunks, collection_name)
-        task.start()
-        # Poll task.progress, task.is_done, task.result from the UI
     """
 
-    def __init__(self, documents: list[Document], collection_name: str = "default"):
-        self.documents = documents
+    def __init__(self, target_path: str, collection_name: str = "default", is_pdf: bool = False):
+        self.target_path = target_path
         self.collection_name = collection_name
+        self.is_pdf = is_pdf
         self.progress: float = 0.0          # 0.0 to 1.0
         self.status: str = "pending"        # pending | running | done | error
+        self.current_step: str = ""         # "Collecting files...", "Embedding chunks..."
         self.result: tuple | None = None    # (Chroma, added_count) on success
         self.error: str = ""
         self._thread: threading.Thread | None = None
 
     def start(self):
-        """Launch the ingestion in a background thread."""
+        """Launch the ingestion process in a background thread."""
         self.status = "running"
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def _run(self):
         try:
+            # 1. Loading Phase
+            self.current_step = f"Loading {'PDF' if self.is_pdf else 'codebase'}..."
             self.progress = 0.1
-            db, added = ingest_into_chroma(self.documents, self.collection_name)
+            
+            if self.is_pdf:
+                # PDF ingestion is usually fast, so we do it in one go
+                from langchain_community.document_loaders import PyPDFLoader
+                loader = PyPDFLoader(self.target_path)
+                raw_docs = loader.load()
+                from config import PDF_CHUNK_SIZE
+                splitter = _get_splitter(chunk_size_override=PDF_CHUNK_SIZE)
+                chunks = splitter.split_documents(raw_docs)
+            else:
+                # Codebase ingestion with file-by-file progress
+                def _update_progress(curr, tot, name):
+                    self.current_step = f"Collecting codebase: {name}"
+                    # Loading phase covers 0.1 to 0.4 progress
+                    self.progress = 0.1 + (curr / tot) * 0.3
+
+                chunks = load_and_chunk_codebase(self.target_path, on_progress=_update_progress)
+
+            if not chunks:
+                self.error = "No relevant content found to ingest."
+                self.status = "error"
+                return
+
+            # 2. Ingestion Phase
+            self.current_step = f"Embedding {len(chunks)} chunks into ChromaDB..."
+            self.progress = 0.5
+            
+            # Note: ChromaDB ingestion is synchronous but embedding happens here
+            db, added = ingest_into_chroma(chunks, self.collection_name)
+            
             self.progress = 1.0
+            self.current_step = f"Successfully ingested {added} chunks!"
             self.result = (db, added)
             self.status = "done"
         except Exception as e:
-            self.error = str(e)
+            self.error = f"Ingestion failed: {str(e)}"
             self.status = "error"
 
     @property
     def is_done(self) -> bool:
         return self.status in ("done", "error")
+
 
 
 def summarize_document_for_pin(file_path: str, max_chars: int = 3000) -> str:

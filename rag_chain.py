@@ -38,6 +38,9 @@ from config import (
     SENTINEL_INTERVAL,
     SENTINEL_MAX_TOKENS,
     PROVIDER_CACHE_PROFILES,
+    ENABLE_HYBRID_SEARCH,
+    BM25_WEIGHT,
+    VECTOR_WEIGHT,
 )
 
 from langchain_core.messages import (
@@ -45,6 +48,16 @@ from langchain_core.messages import (
     AIMessage,
     BaseMessage,
 )
+
+import os
+import pickle
+from rank_bm25 import BM25Okapi
+from nltk.tokenize import word_tokenize
+from backend import load_bm25_index
+
+# 🚀 Elite Patterns: LLM Intent Routing
+# We use a fast, local model (1B-3B parameters) for orchestration.
+AGENT_ROUTER_MODEL = "llama3.2:1b"
 
 # Prefix used by app.py to signal "use local Ollama with model X"
 OLLAMA_PREFIX = "ollama:"
@@ -180,6 +193,58 @@ def get_retriever(db: Chroma, k: int | None = None, exclude_file: str | None = N
     )
 
 
+def hybrid_search(db: Chroma, query: str, collection_name: str = "default", k: int = 10, exclude_file: str | None = None):
+    """
+    Perform Hybrid Search (BM25 + Vector) with Reciprocal Rank Fusion.
+    """
+    if not ENABLE_HYBRID_SEARCH:
+        # Fallback to vector search
+        retriever = get_retriever(db, k=k, exclude_file=exclude_file)
+        return retriever.invoke(query)
+
+    # 1. 🔍 Vector Search
+    vector_retriever = get_retriever(db, k=k*2, exclude_file=exclude_file)
+    vector_docs = vector_retriever.invoke(query)
+    
+    # 2. 🔍 BM25 Keyword Search
+    bm25_data = load_bm25_index(collection_name)
+    bm25_docs = []
+    if bm25_data:
+        bm25_model = bm25_data["bm25"]
+        all_docs = bm25_data["docs"]
+        
+        tokenized_query = word_tokenize(query.lower())
+        top_n = bm25_model.get_top_n(tokenized_query, all_docs, n=k*2)
+        
+        # Apply filter manual since BM25 model doesn't know about metadata filters
+        if exclude_file:
+            bm25_docs = [d for d in top_n if d.metadata.get("source") != exclude_file]
+        else:
+            bm25_docs = top_n
+
+    # 3. 🧪 Reciprocal Rank Fusion (RRF)
+    # RRF Score(d) = sum(1 / (k + rank))
+    RRF_K = 60
+    scores = {} # {doc_content: score}
+    doc_map = {} # {doc_content: doc_object}
+    
+    def _rank_docs(docs, weight=1.0):
+        for rank, doc in enumerate(docs):
+            content = doc.page_content
+            score = 1.0 / (RRF_K + rank + 1) * weight
+            scores[content] = scores.get(content, 0) + score
+            doc_map[content] = doc
+
+    _rank_docs(vector_docs, weight=VECTOR_WEIGHT)
+    _rank_docs(bm25_docs, weight=BM25_WEIGHT)
+    
+    # Sort by RRF score
+    sorted_contents = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+    final_docs = [doc_map[c] for c in sorted_contents[:k]]
+    
+    return final_docs
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  CROSS-ENCODER RE-RANKER
 # ═══════════════════════════════════════════════════════════════════════════
@@ -262,89 +327,65 @@ def get_reranking_retriever(
     )
 
 
-def hybrid_retrieve(db: Chroma, query: str, k: int | None = None,
-                    exclude_file: str | None = None,
-                    filter_extensions: list[str] | None = None) -> list:
+def hybrid_search(
+    db: Chroma, 
+    query: str, 
+    collection_name: str = "default", 
+    k: int = 10, 
+    exclude_file: str | None = None,
+    filter_extensions: list[str] | None = None
+) -> list[Document]:
     """
-    Phase 2a: Hybrid Search — combine BM25 keyword matching with
-    vector semantic search for precision retrieval.
-
-    BM25 catches exact keyword matches that embeddings might miss.
-    Vector search catches semantic meaning that keywords miss.
-    Results are merged and deduplicated before reranking.
+    Perform Hybrid Search (BM25 + Vector) with Reciprocal Rank Fusion (RRF).
     """
     from config import ENABLE_HYBRID_SEARCH, BM25_WEIGHT, VECTOR_WEIGHT
-
-    top_k = k or RETRIEVER_K
-
+    
     if not ENABLE_HYBRID_SEARCH:
-        retriever = get_reranking_retriever(
-            db, k=top_k, exclude_file=exclude_file,
-            filter_extensions=filter_extensions
-        )
-        return retriever.invoke(query)
+        # Fallback to standard vector search
+        search_kwargs = {"k": k, "fetch_k": k*5}
+        if exclude_file:
+            search_kwargs["filter"] = {"source": {"$ne": exclude_file}}
+        return db.similarity_search(query, **search_kwargs)
 
-    # 1. Vector search (semantic)
-    vector_results = db.similarity_search_with_relevance_scores(query, k=top_k * 3)
+    # 1. 🔍 Vector Search (Semantic)
+    # We fetch a larger candidate pool for RRF to merge
+    vector_docs = db.similarity_search(query, k=k*3)
+    
+    # 2. 🔍 BM25 Keyword Search
+    bm25_data = load_bm25_index(collection_name)
+    bm25_docs = []
+    if bm25_data:
+        bm25_model = bm25_data["bm25"]
+        all_docs = bm25_data["docs"]
+        
+        tokenized_query = word_tokenize(query.lower())
+        top_n = bm25_model.get_top_n(tokenized_query, all_docs, n=k*3)
+        bm25_docs = top_n
 
-    # 2. BM25-style keyword search via ChromaDB's where_document
-    #    ChromaDB supports $contains for basic keyword matching
-    query_keywords = [w for w in query.lower().split() if len(w) > 3]
-    keyword_results = []
-    for kw in query_keywords[:5]:  # top 5 keywords
-        try:
-            kw_docs = db.get(
-                where_document={"$contains": kw},
-                include=["documents", "metadatas"],
-                limit=top_k,
-            )
-            for doc_text, meta in zip(
-                kw_docs.get("documents", []),
-                kw_docs.get("metadatas", [])
-            ):
-                from langchain_core.documents import Document
-                keyword_results.append(Document(page_content=doc_text, metadata=meta or {}))
-        except Exception:
-            continue
+    # 3. 🧪 Reciprocal Rank Fusion (RRF)
+    # RRF Score(d) = sum(1 / (k + rank))
+    RRF_K = 60
+    scores = {} # {doc_content: score}
+    doc_map = {} # {doc_content: doc_object}
+    
+    def _rank_docs(docs, weight=1.0):
+        for rank, doc in enumerate(docs):
+            if exclude_file and doc.metadata.get("source") == exclude_file:
+                continue
+            if filter_extensions and doc.metadata.get("file_extension") not in filter_extensions:
+                continue
+                
+            content = doc.page_content
+            score = (1.0 / (RRF_K + rank + 1)) * weight
+            scores[content] = scores.get(content, 0) + score
+            doc_map[content] = doc
 
-    # 3. Merge and deduplicate
-    seen = set()
-    merged = []
-    # Vector results first (weighted higher)
-    for doc, score in vector_results:
-        key = doc.page_content[:200]
-        if key not in seen:
-            seen.add(key)
-            doc.metadata["hybrid_vector_score"] = round(float(score), 4)
-            merged.append(doc)
-
-    # Keyword results fill remaining slots
-    for doc in keyword_results:
-        key = doc.page_content[:200]
-        if key not in seen:
-            seen.add(key)
-            doc.metadata["hybrid_keyword_match"] = True
-            merged.append(doc)
-
-    # 4. Rerank the merged set
-    if merged:
-        ce = _get_cross_encoder()
-        scores = ce.score([(query, d.page_content) for d in merged])
-        scored = sorted(zip(merged, scores), key=lambda x: x[1], reverse=True)
-        result = []
-        for doc, score in scored[:RERANKER_TOP_N]:
-            doc.metadata["reranker_score"] = round(float(score), 4)
-            result.append(doc)
-
-        # Deterministic sort for cache stability
-        result.sort(key=lambda d: (
-            -round(float(d.metadata.get("reranker_score", 0)) * 20) / 20.0,
-            d.metadata.get("source", ""),
-            d.page_content
-        ))
-        return result
-
-    return []
+    _rank_docs(vector_docs, weight=VECTOR_WEIGHT)
+    _rank_docs(bm25_docs, weight=BM25_WEIGHT)
+    
+    # Sort by merged RRF score
+    sorted_contents = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+    return [doc_map[c] for c in sorted_contents[:k]]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -403,129 +444,73 @@ def _prepare_history_with_cache(history: list[BaseMessage], model: str | None) -
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def build_sentinel_state_block(
-    history: list[BaseMessage],
-    existing_block: str = "",
-    llm=None,
-) -> str:
+# 🚀 Local LLM Orchestrator (Agentic Router)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class AgenticRouter:
     """
-    Sentinel History Cache: Every SENTINEL_INTERVAL turns, compress
-    the conversation history into a compact State Block (~500 tokens).
-
-    The State Block is pinned at the top of the prompt so the LLM
-    retains full conversational context while keeping the cached
-    prefix small and stable.
-
-    If no LLM is provided, falls back to a local extractive summary
-    (no API call, zero cost).
+    Decoupled decision engine using a fast local LLM (llama3.2:1b)
+    to handle classification, rewriting, and summarization tasks.
     """
-    turn_count = sum(1 for m in history if isinstance(m, HumanMessage))
+    def __init__(self, model_name: str = AGENT_ROUTER_MODEL):
+        try:
+            self.llm = get_llm(model=f"{OLLAMA_PREFIX}{model_name}", temperature=0.0, streaming=False)
+        except Exception:
+            self.llm = None
 
-    # Only rebuild every N turns
-    if turn_count % SENTINEL_INTERVAL != 0 or turn_count == 0:
-        return existing_block
+    def classify_intent(self, query: str, history: list[BaseMessage]) -> str:
+        """Classify as NEW topic or FOLLOW-UP with context reuse."""
+        if not self.llm or not history:
+            return "NEW" # conservative fallback
+            
+        context = "\n".join([f"{'User' if isinstance(m, HumanMessage) else 'AI'}: {m.content[:200]}" for m in history[-3:]])
+        prompt = (
+            f"Given the chat history:\n{context}\n\n"
+            f"And the new user prompt: '{query}'\n\n"
+            "Is the new prompt a follow-up to the current topic or a completely NEW topic?\n"
+            "Reply ONLY with 'FOLLOW-UP' or 'NEW'."
+        )
+        try:
+            response = self.llm.invoke(prompt)
+            content = response.content.upper()
+            return "FOLLOW-UP" if "FOLLOW-UP" in content else "NEW"
+        except Exception:
+            return "NEW"
 
-    # --- Local extractive summary (no LLM call, zero cost) ---
-    topics = []
-    for msg in history:
-        if isinstance(msg, HumanMessage):
-            topics.append(f"- Q: {msg.content[:120]}")
-        elif isinstance(msg, AIMessage):
-            # Extract just the first sentence of each AI response
-            first_line = msg.content.split("\n")[0][:150]
-            topics.append(f"  A: {first_line}")
+    def rewrite_query(self, query: str, history: list[BaseMessage]) -> str:
+        """Rewrite a vague follow-up into a standalone search query."""
+        if not self.llm or not history:
+            return query
+            
+        context = "\n".join([f"{'User' if isinstance(m, HumanMessage) else 'AI'}: {m.content[:300]}" for m in history[-2:]])
+        prompt = (
+            f"Chat History:\n{context}\n\n"
+            f"User just said: '{query}'\n\n"
+            "Rewrite this into a standalone search query that includes all necessary context. "
+            "Reply ONLY with the rewritten query."
+        )
+        try:
+            response = self.llm.invoke(prompt)
+            return response.content.strip().strip('"')
+        except Exception:
+            return query
 
-    summary = "\n".join(topics[-SENTINEL_INTERVAL * 2:])  # last N turns
-
-    state_block = (
-        f"CONVERSATION STATE (auto-summarized at turn {turn_count}):\n"
-        f"Topics discussed so far:\n{summary}\n"
-        f"---\n"
-        f"Previous state: {existing_block[:200] if existing_block else 'None'}"
-    )
-
-    # Trim to budget
-    if len(state_block) > SENTINEL_MAX_TOKENS * 4:  # rough char estimate
-        state_block = state_block[:SENTINEL_MAX_TOKENS * 4]
-
-    return state_block
-
-
-def is_semantic_lock_query(user_input: str) -> bool:
-    """
-    Semantic Locking: Detect if the query is a follow-up that should
-    bypass retrieval entirely and reuse the exact previous context.
-
-    Returns True for:
-      - Pronoun-led queries ("it", "this", "that")
-      - Follow-up indicators ("Why?", "Explain more", "How?")
-      - Very short continuation queries (1-3 words)
-    """
-    q = user_input.strip().lower()
-    words = q.split()
-
-    # Very short queries (1-3 words) are almost always follow-ups
-    if len(words) <= 3:
-        return True
-
-    # Starts with a pronoun or follow-up word
-    followup_starters = [
-        "it", "this", "that", "these", "those", "they",
-        "why", "how", "what about", "explain", "elaborate",
-        "tell me more", "go on", "continue", "and", "also",
-        "same", "again", "more", "yes", "no", "ok",
-    ]
-    for starter in followup_starters:
-        if q.startswith(starter):
-            return True
-
-    # Ends with a question mark and is short
-    if q.endswith("?") and len(words) <= 6:
-        return True
-
-    return False
-
-
-def rewrite_query_with_context(user_input: str, history: list[BaseMessage]) -> str:
-    """
-    Rewrite a short/ambiguous follow-up query by injecting context
-    from recent chat history. This helps ChromaDB retrieve the right
-    chunks when the user says things like "what does it do?" or
-    "explain the second one".
-
-    This is a LOCAL rewrite (no LLM call) — fast and free.
-    """
-    if not history:
-        return user_input
-
-    # Only rewrite short queries that are likely follow-ups
-    if len(user_input.split()) > 12:
-        return user_input  # long enough to stand on its own
-
-    # Extract the last human query for context
-    prev_human_msgs = [m for m in history if isinstance(m, HumanMessage)]
-    if not prev_human_msgs:
-        return user_input
-
-    prev_query = prev_human_msgs[-1].content
-
-    # Detect pronouns / vague references that need context
-    vague_patterns = [
-        "it", "this", "that", "these", "those", "they", "them",
-        "the function", "the file", "the code", "the class",
-        "the module", "the method", "above", "same",
-    ]
-    query_lower = user_input.lower()
-    has_vague_ref = any(f" {p} " in f" {query_lower} " or
-                        query_lower.startswith(f"{p} ") or
-                        query_lower.endswith(f" {p}")
-                        for p in vague_patterns)
-
-    if has_vague_ref or len(user_input.split()) <= 5:
-        # Prepend previous query as context for ChromaDB search
-        return f"{prev_query}\n{user_input}"
-
-    return user_input
+    def summarize_state(self, history: list[BaseMessage]) -> str:
+        """Create a dense 3-bullet summary of the conversation state."""
+        if not self.llm:
+            return "None."
+            
+        context = "\n".join([f"{'User' if isinstance(m, HumanMessage) else 'AI'}: {m.content[:500]}" for m in history[-6:]])
+        prompt = (
+            f"History:\n{context}\n\n"
+            "Summarize the conversation state so far in exactly 3 dense bullet points. "
+            "Focus on technical topics discussed. Reply ONLY with the bullet points."
+        )
+        try:
+            response = self.llm.invoke(prompt)
+            return response.content.strip()
+        except Exception:
+            return "Error generating summary."
 
 
 def build_rag_chain(db: Chroma, model: str | None = None):
@@ -580,46 +565,59 @@ def build_rag_chain(db: Chroma, model: str | None = None):
     # inside the raw message chunks.
     question_answer_chain = prompt | llm
 
+    # 🚀 Professional Polish: Instantiate Agentic Router
+    router = AgenticRouter()
+
     def _full_context_cache_chain(inputs: dict):
         """
-        Unified chain with Sentinel History, Semantic Locking,
+        Unified chain with Agentic Routing, Hybrid Search,
         and Cross-Provider cache awareness.
         """
         user_input = inputs["input"]
         pinned_content = inputs.get("full_source_context", "")
         history = inputs.get("chat_history", [])
+        coll_name = inputs.get("collection_name", "default")
 
-        # 1. Sentinel History Cache: build/update the state block
+        # 1. 🤖 Agentic Sentinel: Update conversation state summary
         existing_sentinel = inputs.get("sentinel_state", "")
-        inputs["sentinel_state"] = build_sentinel_state_block(
-            history, existing_block=existing_sentinel
-        )
+        turn_count = sum(1 for m in history if isinstance(m, HumanMessage))
+        
+        if turn_count > 0 and turn_count % SENTINEL_INTERVAL == 0:
+            inputs["sentinel_state"] = router.summarize_state(history)
+        else:
+            inputs["sentinel_state"] = existing_sentinel
 
-        # 2. Pinned context passthrough
+        # 2. 🤖 Agentic Router: Intent Classification
+        intent = router.classify_intent(user_input, history)
+        
+        # 3. Pinned context passthrough
         inputs["full_source_context"] = pinned_content if (pinned_content and pinned_content != "None pinned.") else "None pinned."
 
-        # 3. Retrieval path
+        # 4. Retrieval path
         cached_input = inputs.get("cached_docs")
         
         stable_docs = []
         new_docs = []
         
-        if isinstance(cached_input, dict):
-            # 🚀 Split Context Path
-            stable_docs = cached_input.get("stable", [])
-            new_docs = cached_input.get("new", [])
-        elif cached_input:
-            # Fallback for old list format
-            stable_docs = cached_input
+        # Use existing cache if intent is FOLLOW-UP and cache exists
+        if intent == "FOLLOW-UP" and cached_input:
+            if isinstance(cached_input, dict):
+                stable_docs = cached_input.get("stable", [])
+                new_docs = cached_input.get("new", [])
+            else:
+                stable_docs = cached_input
         else:
-            # No cache provided, perform fresh retrieval (if db exists)
+            # Fresh retrieval: Use Agentic Rewriting for precise search signal
             if db:
-                search_signal = rewrite_query_with_context(user_input, history)
+                search_signal = router.rewrite_query(user_input, history) if intent == "FOLLOW-UP" else user_input
                 pinned_file = inputs.get("exclude_file")
                 ext_filter = inputs.get("filter_extensions")
+                
                 # Use hybrid search (BM25 + vector) for better precision
-                new_docs = hybrid_retrieve(
+                new_docs = hybrid_search(
                     db, search_signal,
+                    collection_name=coll_name,
+                    k=RETRIEVER_K,
                     exclude_file=pinned_file,
                     filter_extensions=ext_filter,
                 )
@@ -638,7 +636,7 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         # Normalise history format with model-awareness
         inputs["chat_history"] = _prepare_history_with_cache(history, model)
         
-        yield {"context": inputs["context"]}
+        yield {"context": inputs["context"], "intent": intent}
         for chunk in question_answer_chain.stream(inputs):
             # Extract content string while preserving the raw chunk for metadata (caching)
             content = chunk.content if hasattr(chunk, "content") else str(chunk)

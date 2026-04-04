@@ -30,10 +30,7 @@ from backend import (
     get_collection_info,
     delete_collection,
 )
-from rag_chain import (
-    build_rag_chain, OLLAMA_PREFIX, get_reranking_retriever,
-    rewrite_query_with_context, is_semantic_lock_query,
-)
+from rag_chain import build_rag_chain, OLLAMA_PREFIX, get_reranking_retriever
 from config import (
     DEFAULT_MODEL, CLOUDROUTER_MODELS, OLLAMA_MODELS,
     SEMANTIC_CACHE_THRESHOLD, PINNED_RELEVANCE_THRESHOLD,
@@ -142,6 +139,10 @@ if "token_usage" not in st.session_state:
     st.session_state.token_usage = {}
 if "debug_mode" not in st.session_state:
     st.session_state.debug_mode = False
+if "ingestion_task" not in st.session_state:
+    st.session_state.ingestion_task = None
+if "ingestion_done_processed" not in st.session_state:
+    st.session_state.ingestion_done_processed = False
 if "sentinel_state" not in st.session_state:
     st.session_state.sentinel_state = ""
 if "filter_extensions" not in st.session_state:
@@ -417,17 +418,21 @@ with st.sidebar:
         type=["pdf"],
         accept_multiple_files=False,
     )
-    if st.button("⚡ Ingest PDF", disabled=uploaded_pdf is None, use_container_width=True):
-        with st.spinner("Reading & chunking PDF…"):
-            chunks = load_and_chunk_pdf_upload(uploaded_pdf, uploaded_pdf.name)
-        with st.spinner(f"Embedding {len(chunks)} chunks into ChromaDB…"):
-            _, added = ingest_into_chroma(chunks, collection_name=collection_name)
-        st.success(f"✅ Ingested **{added}** new chunks from `{uploaded_pdf.name}` ({len(chunks) - added} duplicates skipped)")
-        st.session_state.active_collection = collection_name
-        st.session_state.rag_chain = None        # force rebuild
-        # 🚀 Invalidation: New ingestion clears existing cache
-        st.session_state.last_query_vector = None
-        st.session_state.last_docs = []
+    if st.button("⚡ Ingest PDF", disabled=uploaded_pdf is None or st.session_state.ingestion_task is not None, use_container_width=True):
+        # 🚀 Fix: Use background task for PDF ingestion
+        import tempfile
+        from pathlib import Path
+        suffix = Path(uploaded_pdf.name).suffix or ".pdf"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(uploaded_pdf.read())
+            tmp_path = tmp.name
+        
+        from backend import AsyncIngestionTask
+        task = AsyncIngestionTask(tmp_path, collection_name=collection_name, is_pdf=True)
+        task.start()
+        st.session_state.ingestion_task = task
+        st.session_state.ingestion_done_processed = False
+        st.rerun()
 
     st.divider()
 
@@ -438,31 +443,16 @@ with st.sidebar:
         value=st.session_state.pop("pending_folder", "") if "pending_folder" in st.session_state else "",
         placeholder=r"C:\Users\HP\my_project",
     )
-    if st.button("⚡ Ingest Folder", disabled=not folder_path, use_container_width=True):
+    if st.button("⚡ Ingest Folder", disabled=not folder_path or st.session_state.ingestion_task is not None, use_container_width=True):
         if not os.path.isdir(folder_path):
             st.error("❌ Directory not found. Check the path.")
         else:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-
-            def _update_progress(current: int, total: int, filename: str):
-                progress_bar.progress(current / total if total else 1.0)
-                status_text.text(f"Processing {current}/{total}: {filename}")
-
-            chunks = load_and_chunk_codebase(folder_path, on_progress=_update_progress)
-            progress_bar.empty()
-            status_text.empty()
-            if not chunks:
-                st.warning("⚠️ No supported code files found in that directory.")
-            else:
-                with st.spinner(f"Embedding {len(chunks)} chunks into ChromaDB…"):
-                    _, added = ingest_into_chroma(chunks, collection_name=collection_name)
-                st.success(f"✅ Ingested **{added}** new chunks from `{folder_path}` ({len(chunks) - added} duplicates skipped)")
-                st.session_state.active_collection = collection_name
-                st.session_state.rag_chain = None
-                # 🚀 Invalidation: Folder ingestion clears existing cache
-                st.session_state.last_query_vector = None
-                st.session_state.last_docs = []
+            from backend import AsyncIngestionTask
+            task = AsyncIngestionTask(folder_path, collection_name=collection_name, is_pdf=False)
+            task.start()
+            st.session_state.ingestion_task = task
+            st.session_state.ingestion_done_processed = False
+            st.rerun()
 
     st.divider()
 
@@ -586,6 +576,39 @@ else:
         unsafe_allow_html=True,
     )
 
+# ── 🚀 BACKGROUND INGESTION PROGRESS ─────────────────────────────────────────
+if st.session_state.ingestion_task:
+    task = st.session_state.ingestion_task
+    
+    if task.status == "running":
+        progress_val = min(1.0, task.progress)
+        st.info(f"⚡ **Background Ingestion in Progress...**")
+        st.progress(progress_val)
+        st.caption(f"Currently: {task.current_step}")
+        import time
+        time.sleep(1) # Simple polling mechanism
+        st.rerun()
+        
+    elif task.status == "done" and not st.session_state.ingestion_done_processed:
+        # Success state: Handle the completed result
+        _, added = task.result
+        st.success(f"✅ **Ingestion Complete!** Added **{added}** new chunks.")
+        st.session_state.active_collection = task.collection_name
+        st.session_state.rag_chain = None
+        st.session_state.last_query_vector = None
+        st.session_state.last_docs = []
+        st.session_state.ingestion_done_processed = True
+        # Keep success message visible for a bit
+        if st.button("Clear Notification", key="clear_ingest"):
+            st.session_state.ingestion_task = None
+            st.rerun()
+
+    elif task.status == "error":
+        st.error(f"❌ **Ingestion Failed:** {task.error}")
+        if st.button("Clear Error", key="clear_ingest_err"):
+            st.session_state.ingestion_task = None
+            st.rerun()
+
 # ── Render chat history ───────────────────────────────────────────────────
 for msg in st.session_state.chat_history:
     with st.chat_message(msg["role"]):
@@ -649,110 +672,75 @@ if user_input:
             st.session_state.token_usage = {}
 
             def response_generator():
-                # ── HYBRID INTENT GUARD ──────────────────────────────────
-                # Detect if we should FORCE a fresh retrieval
-                is_forced = detect_force_retrieval(user_input, st.session_state.active_collection)
-
                 cached_docs = None
-                q_vector = None
-
-                if st.session_state.vector_db and not is_forced:
-                    # 1. SEMANTIC LOCKING: Short follow-ups like "why?",
-                    #    "explain more", "how does it work?" bypass retrieval
-                    #    entirely and reuse the exact previous context.
-                    if (is_semantic_lock_query(user_input)
-                            and st.session_state.last_docs):
-                        cached_docs = {"stable": st.session_state.last_docs, "new": []}
-                        st.toast("Semantic lock — reusing exact context (0 retrieval cost)", icon="🔒")
-                    else:
-                        # 2. Embed query for similarity check
+                # Check for semantic similarity to skip retrieval (UI side)
+                # Note: The backend AgenticRouter also does its own logic, 
+                # but we keep this for the 'Instant UI Response' if sim is very high.
+                if st.session_state.get("vector_db") and st.session_state.last_query_vector is not None:
+                    try:
                         q_vector = st.session_state.vector_db.embeddings.embed_query(user_input)
+                        sim = np.dot(q_vector, st.session_state.last_query_vector)
+                        if sim >= SEMANTIC_CACHE_THRESHOLD:
+                            cached_docs = {"stable": st.session_state.last_docs, "new": []}
+                            st.toast(f"Cache hit (sim={sim:.2f}) — reusing previous context", icon="⚡")
+                    except Exception:
+                        pass
 
-                        # 3. TRUE CACHE SKIP: If follow-up is semantically similar,
-                        #    reuse last docs WITHOUT calling ChromaDB at all.
-                        if st.session_state.last_query_vector is not None and st.session_state.last_docs:
-                            sim = np.dot(q_vector, st.session_state.last_query_vector)
-
-                            if sim >= SEMANTIC_CACHE_THRESHOLD:
-                                cached_docs = {"stable": st.session_state.last_docs, "new": []}
-                                st.toast(
-                                    f"Cache hit (sim={sim:.2f}) — skipped retrieval, reusing {len(st.session_state.last_docs)} chunks",
-                                    icon="⚡"
-                                )
-                        # else: similarity too low, let rag_chain do fresh retrieval
-
-                # ── PINNED FILE RELEVANCE GATE ───────────────────────────
-                # Only inject the pinned file if the query is actually
-                # related to it — otherwise skip to save tokens.
-                pinned_to_send = st.session_state.pinned_content
-                if (st.session_state.pinned_file
-                        and st.session_state.vector_db
-                        and pinned_to_send != "None pinned."):
-                    pinned_vector = st.session_state.vector_db.embeddings.embed_query(
-                        os.path.basename(st.session_state.pinned_file)
-                    )
-                    if q_vector is not None:
-                        pinned_sim = float(np.dot(q_vector, pinned_vector))
-                    else:
-                        # q_vector not computed (no vector_db or forced refresh)
-                        temp_vec = st.session_state.vector_db.embeddings.embed_query(user_input)
-                        pinned_sim = float(np.dot(temp_vec, pinned_vector))
-
-                    if pinned_sim < PINNED_RELEVANCE_THRESHOLD:
-                        pinned_to_send = "None pinned."
-                        st.toast(f"Pinned file skipped (relevance={pinned_sim:.2f})", icon="📌")
-
-                # ── GHOST HISTORY with AI response truncation ────────────
+                pinned_to_send = st.session_state.get("pinned_content", "None pinned.")
+                
+                # Identify history for the chain
                 if len(lc_history) <= GHOST_HISTORY_MAX:
                     truncated_history = _truncate_ai_in_history(lc_history)
                 else:
                     anchor = lc_history[:2]
-                    ghosts = [msg for msg in lc_history[2:-GHOST_HISTORY_WINDOW]
-                              if isinstance(msg, HumanMessage)]
+                    ghosts = [msg for msg in lc_history[2:-GHOST_HISTORY_WINDOW] if isinstance(msg, HumanMessage)]
                     window = lc_history[-GHOST_HISTORY_WINDOW:]
+                    from app import _truncate_ai_in_history
                     truncated_history = _truncate_ai_in_history(anchor + ghosts + window)
-                
+
                 stream_iter = chain.stream({
                     "input": user_input,
                     "chat_history": truncated_history,
                     "full_source_context": pinned_to_send,
-                    "exclude_file": st.session_state.pinned_file,
+                    "exclude_file": st.session_state.get("pinned_file"),
                     "cached_docs": cached_docs,
+                    "collection_name": st.session_state.active_collection or "default",
                     "sentinel_state": st.session_state.sentinel_state,
                     "filter_extensions": st.session_state.filter_extensions or None,
                 })
 
                 generation_id = None
                 for chunk in stream_iter:
-                    raw = chunk.get("raw_chunk")
-                    if raw:
-                        # Try to capture the generation ID for post-stream usage fetch
-                        if hasattr(raw, "response_metadata") and raw.response_metadata:
-                            gen_id = raw.response_metadata.get("id")
-                            if gen_id:
-                                generation_id = gen_id
-                            # Try streaming metadata (may still be empty)
-                            new_usage = extract_usage_metadata(raw)
-                            if new_usage:
-                                st.session_state.token_usage = new_usage
-                            if st.session_state.debug_mode:
-                                st.session_state["debug_meta"] = raw.response_metadata
+                    # ── 🤖 INTELLIGENT METADATA ───────────────────────────
+                    if "intent" in chunk:
+                        intent = chunk["intent"]
+                        if intent == "FOLLOW-UP":
+                            st.toast("Local LLM: Contextual Refinement 🤖", icon="🧠")
+                        else:
+                            st.toast("Local LLM: New Concept Detected 🤖", icon="✨")
 
                     if "context" in chunk:
                         full_response["context"] = chunk["context"]
                         st.session_state.last_docs = chunk["context"]
-                        if q_vector is not None:
-                            st.session_state.last_query_vector = q_vector
-                        elif st.session_state.vector_db:
-                            st.session_state.last_query_vector = st.session_state.vector_db.embeddings.embed_query(user_input)
+
                     if "answer" in chunk:
                         full_response["answer"] += chunk["answer"]
                         yield chunk["answer"]
 
+                    # Capture usage metadata
+                    raw = chunk.get("raw_chunk")
+                    if raw:
+                        if hasattr(raw, "response_metadata") and raw.response_metadata:
+                            gen_id = raw.response_metadata.get("id")
+                            if gen_id: generation_id = gen_id
+                            
+                            new_usage = extract_usage_metadata(raw)
+                            if new_usage: st.session_state.token_usage = new_usage
+                            if st.session_state.debug_mode:
+                                st.session_state["debug_meta"] = raw.response_metadata
+
                 # POST-STREAM USAGE FETCH
-                # Streaming returns no usage data, so fetch it from
-                # OpenRouter's /generation endpoint using the generation ID.
-                if generation_id and not st.session_state.token_usage.get("input"):
+                if generation_id and not st.session_state.token_usage.get("input") and not st.session_state.model_id.startswith(OLLAMA_PREFIX):
                     fetched = _fetch_generation_usage(generation_id)
                     if fetched:
                         st.session_state.token_usage = fetched
