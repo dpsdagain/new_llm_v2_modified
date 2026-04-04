@@ -522,6 +522,26 @@ with st.sidebar:
     st.markdown("### 🛠️ Developer Tools")
     st.session_state.debug_mode = st.toggle("Debug Mode", value=st.session_state.debug_mode, help="Show retrieval details and reranker scores")
 
+    # ── Cache Strategy ────────────────────────────────────────────────
+    import config as _cfg
+    trust_native = st.toggle(
+        "Trust Native Cache",
+        value=_cfg.TRUST_NATIVE_CACHE,
+        help=(
+            "When ON: always retrieve fresh chunks every turn. "
+            "If the same chunks return, the provider cache kicks in at ~10% cost. "
+            "Avoids stale-context hallucinations on subtle topic shifts.\n\n"
+            "When OFF: skip retrieval when queries are very similar (semantic cache). "
+            "Faster, but risks serving wrong context if the topic subtly shifts."
+        ),
+    )
+    if trust_native != _cfg.TRUST_NATIVE_CACHE:
+        _cfg.TRUST_NATIVE_CACHE = trust_native
+        st.toast(
+            "Always-retrieve mode ON" if trust_native else "Semantic cache ON",
+            icon="🔄" if trust_native else "⚡",
+        )
+
     st.divider()
 
     # ── Metadata Filtering (Phase 1b) ────────────────────────────────

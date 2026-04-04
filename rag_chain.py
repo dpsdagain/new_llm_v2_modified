@@ -37,8 +37,11 @@ from config import (
     MAX_CACHE_CHECKPOINTS,
     MIN_PREV_QUERY_LENGTH,
     MIN_CURRENT_QUERY_LENGTH,
+    SEMANTIC_CACHE_THRESHOLD,
     SENTINEL_INTERVAL,
     SENTINEL_MAX_TOKENS,
+    SENTINEL_TOKEN_THRESHOLD,
+    TRUST_NATIVE_CACHE,
     PROVIDER_CACHE_PROFILES,
     ENABLE_HYBRID_SEARCH,
     BM25_WEIGHT,
@@ -54,11 +57,64 @@ from langchain_core.messages import (
     BaseMessage,
 )
 
+import hashlib
 import os
 import pickle
 from rank_bm25 import BM25Okapi
 from nltk.tokenize import word_tokenize
 from backend import load_bm25_index
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  EXACT-MATCH QUERY CACHE
+# ═══════════════════════════════════════════════════════════════════════════
+# Zero-cost layer: if the user sends the *exact* same query string as the
+# previous turn, we can skip the embedding call entirely and reuse both
+# the cached embedding and the cached documents.  This handles the common
+# case of accidental double-submits and literal repeats with zero compute.
+
+_last_query_hash: str | None = None
+_last_query_embedding_cache: list[float] | None = None
+
+
+def _exact_match_cache_check(query: str) -> list[float] | None:
+    """Return the cached embedding if *query* is byte-identical to the last one."""
+    global _last_query_hash
+    q_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()
+    if q_hash == _last_query_hash and _last_query_embedding_cache is not None:
+        return _last_query_embedding_cache
+    return None
+
+
+def _exact_match_cache_store(query: str, embedding: list[float]):
+    """Store the query hash and embedding for exact-match reuse."""
+    global _last_query_hash, _last_query_embedding_cache
+    _last_query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()
+    _last_query_embedding_cache = embedding
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PINNED CONTENT EMBEDDING CACHE
+# ═══════════════════════════════════════════════════════════════════════════
+# The pinned file embedding was previously recomputed from
+# pinned_content[:2000] on *every single turn*.  Now we cache it
+# and only recompute when the pinned content actually changes.
+
+_pinned_content_hash: str | None = None
+_pinned_content_embedding: list[float] | None = None
+
+
+def _get_pinned_embedding(pinned_content: str) -> list[float]:
+    """Return a cached embedding for the pinned content prefix."""
+    global _pinned_content_hash, _pinned_content_embedding
+    # Hash only the prefix we actually embed
+    prefix = pinned_content[:2000]
+    p_hash = hashlib.sha256(prefix.encode("utf-8")).hexdigest()
+    if p_hash == _pinned_content_hash and _pinned_content_embedding is not None:
+        return _pinned_content_embedding
+    from backend import get_embedding_model
+    _pinned_content_embedding = get_embedding_model().embed_query(prefix)
+    _pinned_content_hash = p_hash
+    return _pinned_content_embedding
 
 # 🚀 Elite Patterns: LLM Intent Routing
 # We use a fast, local model (1B-3B parameters) for orchestration.
@@ -284,28 +340,39 @@ def get_reranking_retriever(
 
 
 def hybrid_search(
-    db: Chroma, 
-    query: str, 
-    collection_name: str = "default", 
-    k: int = 10, 
+    db: Chroma,
+    query: str,
+    collection_name: str = "default",
+    k: int = 10,
     exclude_file: str | None = None,
-    filter_extensions: list[str] | None = None
+    filter_extensions: list[str] | None = None,
+    query_embedding: list[float] | None = None,
 ) -> list[Document]:
     """
     Perform Hybrid Search (BM25 + Vector) with Reciprocal Rank Fusion (RRF).
+
+    If *query_embedding* is provided, it is reused for the vector search
+    via ``similarity_search_by_vector``, avoiding a redundant embedding
+    inference that ChromaDB would otherwise perform internally.
     """
     from config import ENABLE_HYBRID_SEARCH, BM25_WEIGHT, VECTOR_WEIGHT
-    
+
     if not ENABLE_HYBRID_SEARCH:
         # Fallback to standard vector search
         search_kwargs = {"k": k, "fetch_k": k*5}
         if exclude_file:
             search_kwargs["filter"] = {"source": {"$ne": exclude_file}}
+        if query_embedding:
+            return db.similarity_search_by_vector(query_embedding, **search_kwargs)
         return db.similarity_search(query, **search_kwargs)
 
     # 1. 🔍 Vector Search (Semantic)
-    # We fetch a larger candidate pool for RRF to merge
-    vector_docs = db.similarity_search(query, k=k*3)
+    # We fetch a larger candidate pool for RRF to merge.
+    # Reuse pre-computed embedding when available to avoid double-embedding.
+    if query_embedding:
+        vector_docs = db.similarity_search_by_vector(query_embedding, k=k*3)
+    else:
+        vector_docs = db.similarity_search(query, k=k*3)
     
     # 2. 🔍 BM25 Keyword Search
     bm25_data = load_bm25_index(collection_name)
@@ -342,7 +409,27 @@ def hybrid_search(
     
     # Sort by merged RRF score
     sorted_ids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
-    return [doc_map[did] for did in sorted_ids[:k]]
+    rrf_results = [doc_map[did] for did in sorted_ids[:k]]
+
+    # 🚀 Cross-Encoder Re-ranking on RRF output
+    # Apply cross-encoder scoring to the RRF-merged candidates.
+    # This reorders by true query–document relevance and stores scores
+    # in metadata for debug visibility.
+    if rrf_results:
+        try:
+            ce = _get_cross_encoder()
+            pairs = [(query, doc.page_content) for doc in rrf_results]
+            ce_scores = ce.score(pairs)
+            for doc, score in zip(rrf_results, ce_scores):
+                doc.metadata["reranker_score"] = round(float(score), 4)
+            # Sort descending by cross-encoder score, keep top RERANKER_TOP_N
+            rrf_results.sort(key=lambda d: d.metadata.get("reranker_score", 0), reverse=True)
+            rrf_results = rrf_results[:RERANKER_TOP_N]
+        except Exception:
+            # Graceful fallback: if cross-encoder fails, return RRF order
+            pass
+
+    return rrf_results
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -369,29 +456,20 @@ INSTRUCTIONS:
 
 def _prepare_history_with_cache(history: list[BaseMessage], model: str | None) -> list[BaseMessage]:
     """
-    Inject cache markers into the chat history based on the 4-breakpoint limit.
-    BP 1 and 2 are used by the system instructions and context. 
-    BP 3 and 4 are used here to keep history 'warm'.
+    Prepare chat history for the prompt.
+
+    Previously this placed a cache_control breakpoint on history[0],
+    but that message changes every turn — creating a cache *write*
+    (cost penalty) on every invocation rather than a cache *read*
+    (cost saving).  The 4 system-block breakpoints already cover the
+    stable prefix; adding a 5th on volatile history is counterproductive.
+    We now pass history through as plain messages.
     """
-    max_bp, _ = get_cache_profile(model)
-    if not history or not ENABLE_PROMPT_CACHING or max_bp <= 2 or not is_cache_capable(model):
+    if not history:
         return history
 
-    new_history = []
-    # Identify indices for breakpoints (e.g., start of history and mid-point)
-    # We target the 'content' block to add the cache_control marker.
-    for i, msg in enumerate(history):
-        # 🚀 Final Zero-Gaps: Exactly 4 Breakpoints 
-        # (1:Instructions, 2:Pinned, 3:Stable RAG, 4:Sentinel+History Start)
-        # We only cache the very first history turn to maximize the shared prefix.
-        is_history_start = (i == 0)
-        content = format_message_content(msg.content, model, use_cache=is_history_start)
-
-        if isinstance(msg, HumanMessage):
-            new_history.append(HumanMessage(content=content))
-        else:
-            new_history.append(AIMessage(content=content))
-    return new_history
+    # Return plain messages — no cache markers on volatile content
+    return list(history)
 
 # 🚀 Professional Polish: Linguistic Logic Gates (History vs Speed)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -476,6 +554,10 @@ def _sort_docs_deterministically(docs: list[Document]) -> list[Document]:
     Absolute Zero-Gaps Sorting. Ensures that even if similarity
     scores are identical, the prompt string remains stable to satisfy
     provider-side prompt caching (Anthropic/Gemini).
+
+    Uses content_hash (SHA-256) as the primary tie-breaker — it is
+    unique per chunk and cheaper to compare than full page_content.
+    Full page_content is the final fallback for chunks missing a hash.
     """
     return sorted(
         docs,
@@ -483,8 +565,9 @@ def _sort_docs_deterministically(docs: list[Document]) -> list[Document]:
             str(d.metadata.get("source", "")),
             int(d.metadata.get("chunk_index", 0)),
             str(d.metadata.get("content_hash", "")),
-            # 🚀 Absolute Tie-Breaker: Sort by content subset to guarantee determinism
-            str(d.page_content)[:100]
+            # Full content as absolute tie-breaker (not truncated)
+            # to guarantee byte-level prefix determinism for provider cache
+            str(d.page_content)
         )
     )
 
@@ -578,18 +661,41 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         # to reduce pre-flight latency.
         existing_sentinel = inputs.get("sentinel_state", "")
         turn_count = sum(1 for m in history if isinstance(m, HumanMessage))
-        should_summarize = (turn_count > 0 and turn_count % SENTINEL_INTERVAL == 0)
 
-        # Calculate semantic similarity to last query
+        # Token-aware sentinel trigger: summarize when history is large enough
+        # to cause context pressure, not on a fixed turn cadence.
+        # Rough estimate: 1 token ≈ 4 characters.
+        estimated_history_tokens = sum(len(m.content) for m in history) // 4
+        should_summarize = (
+            turn_count > 0
+            and estimated_history_tokens >= SENTINEL_TOKEN_THRESHOLD
+            and turn_count % SENTINEL_INTERVAL == 0  # still respect interval to avoid every-turn summarization
+        )
+
+        # Calculate semantic similarity to last query.
+        # First try the zero-cost exact-match cache to skip embedding entirely.
         current_similarity = 0.0
         current_emb = None
         if last_query_emb and not force_retrieval:
-            from backend import get_embedding_model
-            current_emb = get_embedding_model().embed_query(user_input)
+            # Layer 0: Exact-match cache (zero compute for identical queries)
+            exact_hit = _exact_match_cache_check(user_input)
+            if exact_hit is not None:
+                current_emb = exact_hit
+            else:
+                from backend import get_embedding_model
+                current_emb = get_embedding_model().embed_query(user_input)
+                _exact_match_cache_store(user_input, current_emb)
             current_similarity = calculate_cosine_similarity(current_emb, last_query_emb)
 
-        # 🚀 Semantic Escape Hatch: If similarity is very high, skip agentic routing
-        is_semantic_hit = current_similarity >= SEMANTIC_CACHE_THRESHOLD
+        # 🚀 Semantic Escape Hatch: If similarity is very high, skip agentic routing.
+        # When TRUST_NATIVE_CACHE is enabled, we never skip retrieval —
+        # instead we always retrieve and let deterministic sorting + the
+        # provider-side cache handle cost.  This avoids the hallucination
+        # risk of serving stale cached docs on subtle topic shifts.
+        is_semantic_hit = (
+            current_similarity >= SEMANTIC_CACHE_THRESHOLD
+            and not TRUST_NATIVE_CACHE
+        )
         
         with ThreadPoolExecutor(max_workers=2) as executor:
             # Only classify if not a semantic hit
@@ -616,12 +722,9 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         if pinned_content and pinned_content != "None pinned.":
             # If we have a query embedding, check similarity
             if current_emb:
-                # We need the pinned file's embedding. This is a bit heavy, 
-                # but essential for Architecture A efficiency. 
-                # Optimization: In a real system, the pinned file's embedding
-                # would be cached as a singleton.
-                from backend import get_embedding_model
-                pinned_emb = get_embedding_model().embed_query(pinned_content[:2000]) # embed prefix for speed
+                # Use cached pinned embedding — only recomputed when
+                # the pinned file changes, not on every turn.
+                pinned_emb = _get_pinned_embedding(pinned_content)
                 pinned_sim = calculate_cosine_similarity(current_emb, pinned_emb)
                 if pinned_sim >= PINNED_RELEVANCE_THRESHOLD:
                     pinned_eligible = True
@@ -656,12 +759,17 @@ def build_rag_chain(db: Chroma, model: str | None = None):
                 if intent == "FOLLOW-UP" and history and current_similarity < 0.6:
                     search_signal = router.rewrite_query(user_input, history)
                 
+                # Reuse the query embedding we already computed for the
+                # semantic-similarity check so ChromaDB does not re-embed
+                # the same string a second time.
+                search_emb = current_emb if (search_signal == user_input and current_emb) else None
                 new_retrievals = hybrid_search(
                     db, search_signal,
                     collection_name=coll_name,
                     k=RETRIEVER_K,
                     exclude_file=pinned_file,
                     filter_extensions=ext_filter,
+                    query_embedding=search_emb,
                 )
 
             # 🤖 Intent-Aware Union Logic
@@ -688,9 +796,16 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         inputs["context"] = sorted_docs
         inputs["chat_history"] = _prepare_history_with_cache(history, model)
         
-        # Pass current embedding back to app for next turn tracking
-        if current_emb is None and is_semantic_hit:
-            current_emb = last_query_emb
+        # Ensure we always have an embedding to pass back for next turn.
+        # On the first turn (no last_query_emb), compute it now so the
+        # semantic cache can function starting from turn 2.
+        if current_emb is None:
+            if is_semantic_hit:
+                current_emb = last_query_emb
+            else:
+                from backend import get_embedding_model
+                current_emb = get_embedding_model().embed_query(user_input)
+                _exact_match_cache_store(user_input, current_emb)
 
         yield {"context": inputs["context"], "intent": intent, "query_embedding": current_emb}
         

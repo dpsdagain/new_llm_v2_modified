@@ -65,7 +65,16 @@ CHUNK_SIZE: int = 1000          # characters per chunk (default fallback)
 CHUNK_OVERLAP: int = 200        # overlap between chunks
 CODE_CHUNK_SIZE: int = 500      # smaller chunks for dense code
 PDF_CHUNK_SIZE: int = 1500      # larger chunks for prose documents
-ZERO_CHUNK_THRESHOLD: int = 200000 # files smaller than this (chars) aren't chunked
+
+# ── Document-Level Caching (Zero Chunking) ─────────────────────────────────
+# Files under this threshold are stored as a single document — no chunking.
+# This guarantees 100% recall on follow-up questions about that file.
+# When the same single-doc chunk appears in the prompt across turns, the
+# provider-side cache (Anthropic/Gemini) handles it at ~10% input cost.
+#
+# 500K chars ≈ 125K tokens — safely within Gemini 2.0 Flash (1M context)
+# and Claude 3.5 (200K context).  For smaller-context models, lower this.
+ZERO_CHUNK_THRESHOLD: int = 500000
 
 # ── ChromaDB ────────────────────────────────────────────────────────────────
 CHROMA_DB_DIR: str = os.path.join(os.path.dirname(__file__), "chroma_db")
@@ -84,6 +93,16 @@ MIN_CURRENT_QUERY_LENGTH: int = 10  # below this, always augment with previous q
 SEMANTIC_CACHE_THRESHOLD: float = 0.85    # cosine similarity to reuse cached docs
 PINNED_RELEVANCE_THRESHOLD: float = 0.40  # min similarity to inject pinned file
 
+# ── Trust Native Cache ────────────────────────────────────────────────────
+# When True, the system ALWAYS retrieves fresh chunks (never skips retrieval
+# on semantic hit).  If the same chunks come back, deterministic sorting
+# produces the same prompt prefix, and the provider-side cache (Anthropic/
+# Gemini) naturally kicks in at ~10 % cost.  If different chunks come back,
+# you get correct context and avoid hallucination from stale cached docs.
+# Trade-off: slightly higher local compute (BM25 + vector each turn) but
+# eliminates the risk of serving wrong context on subtle topic shifts.
+TRUST_NATIVE_CACHE: bool = False
+
 # ── Ghost history ──────────────────────────────────────────────────────────
 GHOST_HISTORY_WINDOW: int = 8             # recent messages to keep in full
 GHOST_HISTORY_MAX: int = 10               # beyond this, truncate with ghost logic
@@ -92,6 +111,7 @@ AI_RESPONSE_MAX_CHARS: int = 500          # max chars per AI message in ghost hi
 # ── Sentinel History Cache ─────────────────────────────────────────────────
 SENTINEL_INTERVAL: int = 5                # summarize every N conversation turns
 SENTINEL_MAX_TOKENS: int = 500            # max tokens for the state-block summary
+SENTINEL_TOKEN_THRESHOLD: int = 3000      # estimated history tokens before forcing a summarization
 
 # ── Cross-Provider Cache Config ────────────────────────────────────────────
 # Provider-specific cache checkpoint limits and minimum token thresholds.
