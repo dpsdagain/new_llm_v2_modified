@@ -198,56 +198,7 @@ def get_retriever(db: Chroma, k: int | None = None, exclude_file: str | None = N
     )
 
 
-def hybrid_search(db: Chroma, query: str, collection_name: str = "default", k: int = 10, exclude_file: str | None = None):
-    """
-    Perform Hybrid Search (BM25 + Vector) with Reciprocal Rank Fusion.
-    """
-    if not ENABLE_HYBRID_SEARCH:
-        # Fallback to vector search
-        retriever = get_retriever(db, k=k, exclude_file=exclude_file)
-        return retriever.invoke(query)
 
-    # 1. 🔍 Vector Search
-    vector_retriever = get_retriever(db, k=k*2, exclude_file=exclude_file)
-    vector_docs = vector_retriever.invoke(query)
-    
-    # 2. 🔍 BM25 Keyword Search
-    bm25_data = load_bm25_index(collection_name)
-    bm25_docs = []
-    if bm25_data:
-        bm25_model = bm25_data["bm25"]
-        all_docs = bm25_data["docs"]
-        
-        tokenized_query = word_tokenize(query.lower())
-        top_n = bm25_model.get_top_n(tokenized_query, all_docs, n=k*2)
-        
-        # Apply filter manual since BM25 model doesn't know about metadata filters
-        if exclude_file:
-            bm25_docs = [d for d in top_n if d.metadata.get("source") != exclude_file]
-        else:
-            bm25_docs = top_n
-
-    # 3. 🧪 Reciprocal Rank Fusion (RRF)
-    # RRF Score(d) = sum(1 / (k + rank))
-    RRF_K = 60
-    scores = {} # {doc_content: score}
-    doc_map = {} # {doc_content: doc_object}
-    
-    def _rank_docs(docs, weight=1.0):
-        for rank, doc in enumerate(docs):
-            content = doc.page_content
-            score = 1.0 / (RRF_K + rank + 1) * weight
-            scores[content] = scores.get(content, 0) + score
-            doc_map[content] = doc
-
-    _rank_docs(vector_docs, weight=VECTOR_WEIGHT)
-    _rank_docs(bm25_docs, weight=BM25_WEIGHT)
-    
-    # Sort by RRF score
-    sorted_contents = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
-    final_docs = [doc_map[c] for c in sorted_contents[:k]]
-    
-    return final_docs
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -370,8 +321,8 @@ def hybrid_search(
     # 3. 🧪 Reciprocal Rank Fusion (RRF)
     # RRF Score(d) = sum(1 / (k + rank))
     RRF_K = 60
-    scores = {} # {doc_content: score}
-    doc_map = {} # {doc_content: doc_object}
+    scores = {} # {doc_id: score}
+    doc_map = {} # {doc_id: doc_object}
     
     def _rank_docs(docs, weight=1.0):
         for rank, doc in enumerate(docs):
@@ -380,17 +331,18 @@ def hybrid_search(
             if filter_extensions and doc.metadata.get("file_extension") not in filter_extensions:
                 continue
                 
-            content = doc.page_content
+            # 🚀 Platinum Optimization: Use composite key to avoid boilerplate collision
+            doc_id = (doc.metadata.get("source"), doc.metadata.get("chunk_index", 0), doc.metadata.get("content_hash", ""))
             score = (1.0 / (RRF_K + rank + 1)) * weight
-            scores[content] = scores.get(content, 0) + score
-            doc_map[content] = doc
+            scores[doc_id] = scores.get(doc_id, 0) + score
+            doc_map[doc_id] = doc
 
     _rank_docs(vector_docs, weight=VECTOR_WEIGHT)
     _rank_docs(bm25_docs, weight=BM25_WEIGHT)
     
     # Sort by merged RRF score
-    sorted_contents = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
-    return [doc_map[c] for c in sorted_contents[:k]]
+    sorted_ids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+    return [doc_map[did] for did in sorted_ids[:k]]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -430,7 +382,8 @@ def _prepare_history_with_cache(history: list[BaseMessage], model: str | None) -
     # We target the 'content' block to add the cache_control marker.
     for i, msg in enumerate(history):
         # 🚀 Final Zero-Gaps: Exactly 4 Breakpoints 
-        # (1:Instructions, 2:Pinned, 3:Stable RAG, 4:History Start)
+        # (1:Instructions, 2:Pinned, 3:Stable RAG, 4:Sentinel+History Start)
+        # We only cache the very first history turn to maximize the shared prefix.
         is_history_start = (i == 0)
         content = format_message_content(msg.content, model, use_cache=is_history_start)
 
@@ -567,14 +520,18 @@ def build_rag_chain(db: Chroma, model: str | None = None):
     max_bp, _ = get_cache_profile(model)
 
     if is_cc:
+        # 🚀 Prefix Stability: Reordered Static -> Dynamic
+        # 1. Core Instructions (Most Stable)
+        # 2. Pinned Context (Stable per Session)
+        # 3. Stable RAG (Stable per turn)
+        # 4. Sentinel State (Dynamic every 5 turns)
         system_blocks = [
             format_message_content(CORE_INSTRUCTIONS, model, use_cache=True)[0],
-            format_message_content("CONVERSATION STATE:\n{sentinel_state}", model, use_cache=True)[0],
             format_message_content("FULL SOURCE CONTEXT (PINNED):\n{full_source_context}", model, use_cache=True)[0],
             format_message_content("STABLE RAG CONTEXT (DETERMINISTIC):\n{stable_context}", model, use_cache=True)[0],
+            format_message_content("CONVERSATION STATE:\n{sentinel_state}", model, use_cache=True)[0],
         ]
         
-        # 🚀 Prefix Stability: chat_history must come AFTER the stable cache blocks
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_blocks),
             MessagesPlaceholder("chat_history"),
@@ -584,9 +541,9 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         # For non-cache models, we still keep the same logical order
         system_text = (
             f"{CORE_INSTRUCTIONS}\n\n"
-            "CONVERSATION STATE:\n{sentinel_state}\n\n"
             "FULL SOURCE CONTEXT (PINNED):\n{full_source_context}\n\n"
-            "STABLE RAG CONTEXT (DETERMINISTIC):\n{stable_context}"
+            "STABLE RAG CONTEXT (DETERMINISTIC):\n{stable_context}\n\n"
+            "CONVERSATION STATE:\n{sentinel_state}"
         )
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_text),
@@ -652,8 +609,27 @@ def build_rag_chain(db: Chroma, model: str | None = None):
             else:
                 inputs["sentinel_state"] = existing_sentinel
         
-        # 3. Pinned context passthrough
-        inputs["full_source_context"] = pinned_content if (pinned_content and pinned_content != "None pinned.") else "None pinned."
+        # 3. Pinned context passthrough with Relevance Gate
+        from config import PINNED_RELEVANCE_THRESHOLD
+        
+        pinned_eligible = False
+        if pinned_content and pinned_content != "None pinned.":
+            # If we have a query embedding, check similarity
+            if current_emb:
+                # We need the pinned file's embedding. This is a bit heavy, 
+                # but essential for Architecture A efficiency. 
+                # Optimization: In a real system, the pinned file's embedding
+                # would be cached as a singleton.
+                from backend import get_embedding_model
+                pinned_emb = get_embedding_model().embed_query(pinned_content[:2000]) # embed prefix for speed
+                pinned_sim = calculate_cosine_similarity(current_emb, pinned_emb)
+                if pinned_sim >= PINNED_RELEVANCE_THRESHOLD:
+                    pinned_eligible = True
+            else:
+                # No embedding yet (first turn, or local), default to True
+                pinned_eligible = True
+
+        inputs["full_source_context"] = pinned_content if pinned_eligible else "None pinned (irrelevant to current query)."
 
         # 4. Retrieval path (Semantic Caching Upgrade)
         cached_input = inputs.get("cached_docs") # Previous context_union

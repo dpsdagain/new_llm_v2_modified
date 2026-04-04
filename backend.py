@@ -340,15 +340,20 @@ def _get_bm25_path(collection_name: str) -> str:
     return os.path.join(CHROMA_DB_DIR, f"{collection_name}_bm25.pkl")
 
 
+# 🚀 Platinum Optimization: In-process BM25 Registry
+_bm25_cache: dict[str, dict] = {}
+
+
 def _update_bm25_index(new_docs: list[Document], collection_name: str):
     """
     Incrementally build or update the BM25 index on disk.
     This avoids expensive ChromaDB full gets and re-tokenization.
     """
+    global _bm25_cache
     path = _get_bm25_path(collection_name)
     
-    # ── 1. Load Existing State ──────────────────────────────────────────
-    existing_data = load_bm25_index(collection_name)
+    # ── 1. Load Existing State (Bypass cache for update) ──────────────
+    existing_data = load_bm25_index(collection_name, use_cache=False)
     
     if existing_data and "tokenized_corpus" in existing_data:
         all_docs = existing_data["docs"]
@@ -365,8 +370,6 @@ def _update_bm25_index(new_docs: list[Document], collection_name: str):
         tokenized_corpus = [word_tokenize(doc.page_content.lower()) for doc in all_docs]
 
     # ── 2. Add New Documents (Strict Parity) ────────────────────────────────
-    # Filter out docs that might already be in the index (based on source/content hash if available)
-    # For now, we trust 'new_docs' are indeed new from the current ingestion task.
     new_tokenized = []
     for doc in new_docs:
         all_docs.append(doc)
@@ -382,21 +385,33 @@ def _update_bm25_index(new_docs: list[Document], collection_name: str):
     payload = {
         "bm25": bm25,
         "docs": all_docs,
-        "tokenized_corpus": tokenized_corpus # 🚀 Saved for next incremental run
+        "tokenized_corpus": tokenized_corpus
     }
     
     with open(path, "wb") as f:
         pickle.dump(payload, f)
+        
+    # Invalidate/Update cache
+    _bm25_cache[collection_name] = payload
 
 
-def load_bm25_index(collection_name: str):
-    """Load the BM25 index from disk."""
+def load_bm25_index(collection_name: str, use_cache: bool = True):
+    """
+    Load the BM25 index from disk with optional in-memory caching.
+    """
+    global _bm25_cache
+    if use_cache and collection_name in _bm25_cache:
+        return _bm25_cache[collection_name]
+
     path = _get_bm25_path(collection_name)
     if not os.path.exists(path):
         return None
     try:
         with open(path, "rb") as f:
-            return pickle.load(f)
+            data = pickle.load(f)
+            if use_cache:
+                _bm25_cache[collection_name] = data
+            return data
     except Exception as e:
         logger.error(f"Failed to load BM25 index: {e}")
         return None

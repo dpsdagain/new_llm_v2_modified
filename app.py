@@ -258,23 +258,28 @@ def _truncate_ai_in_history(history: list) -> list:
 def detect_force_retrieval(query: str, collection_name: str | None) -> bool:
     """
     Detect if the user is explicitly forcing a refresh or mentioning a specific file.
+    Uses regex for word-boundary matching to avoid false positives on common substrings.
     """
+    import re
     force_words = ["refresh", "reload", "force", "update", "latest", "re-retrieve"]
-    if any(word in query.lower() for word in force_words):
-        return True
+    query_lower = query.lower()
+    
+    # ── 1. Check for force keywords ────────────────────────────────────
+    for word in force_words:
+        if re.search(rf"\b{re.escape(word)}\b", query_lower):
+            return True
     
     if not collection_name:
         return False
         
-    # Check for file mentions
+    # ── 2. Check for specific file mentions ────────────────────────────
     try:
         from backend import get_collection_info
         info = get_collection_info(collection_name)
         sources = [os.path.basename(s).lower() for s in info.get("sources", [])]
-        query_lower = query.lower()
-        # Look for any filename in the query (simple word match)
         for src in sources:
-            if src in query_lower:
+            # Match exact filename with word boundaries
+            if re.search(rf"\b{re.escape(src)}\b", query_lower):
                 return True
     except Exception:
         pass
@@ -341,8 +346,9 @@ with st.sidebar:
     if new_model_id != st.session_state.model_id:
         st.session_state.model_id = new_model_id
         st.session_state.rag_chain = None
-        # 🚀 Invalidation: Model change clears context
+        # 🚀 Invalidation: Model change clears context and tracking
         st.session_state.last_docs = []
+        st.session_state.last_query_embedding = None
         st.toast(f"Switched to model: {st.session_state.model_id}", icon="🤖")
 
     st.divider()
@@ -475,6 +481,7 @@ with st.sidebar:
                 st.session_state.rag_chain = None
                 # 🚀 Invalidation: Switching collections clears context
                 st.session_state.last_docs = []
+                st.session_state.last_query_embedding = None
                 st.success(f"Connected to **{chosen}**")
         with col2:
             if st.button("🗑️ Delete", use_container_width=True):
