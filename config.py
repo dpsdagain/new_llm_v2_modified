@@ -16,9 +16,28 @@ OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
 # ── OpenRouter settings ────────────────────────────────────────────────────
 OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
 
-# 🔄 UPGRADE HOOK — Swap this single string to switch models:
-GEMINI_MODEL: str = "google/gemini-2.0-flash-001"
-QWEN_MODEL: str = "qwen/qwen3.6-plus:free"
+# 🔄 CLOUDROUTER MODELS — Categorised by Specialisation (2026 Fleet)
+CLOUDROUTER_MODELS: dict[str, dict[str, str]] = {
+    "Coding & Logic": {
+        "Qwen 3 Coder 480B (SOTA)": "qwen/qwen3-coder:free",
+        "Gemini 2.0 Flash (Stable)": "google/gemini-2.0-flash-001",
+    },
+    "Deep Reasoning": {
+        "DeepSeek R1 (Full)": "deepseek/deepseek-r1:free",
+        "Qwen 3.6 Plus (Balanced)": "qwen/qwen3.6-plus:free",
+    },
+    "Speed & Efficiency": {
+        "Nvidia Nemotron Nano 9B v2": "nvidia/nemotron-nano-9b-v2:free",
+        "Mistral Small 3.1 (24B)": "mistralai/mistral-small-3.1-24b-instruct:free",
+    },
+    "Vision & Images": {
+        "Qwen 2.5 VL (Multimodal)": "qwen/qwen-2.5-vl-7b-instruct:free",
+        "Kimi VL (High Reasoning)": "moonshotai/kimi-vl-a3b-thinking:free",
+    }
+}
+
+# The default model to use on startup
+DEFAULT_MODEL: str = "google/gemini-2.0-flash-001"
 
 # 🚀 PROMPT CACHING — Harnessing from Claude Code
 # The required beta header for Anthropic's prompt caching feature
@@ -55,6 +74,38 @@ RETRIEVER_FETCH_K: int = 20     # MMR fetches more, then picks diverse top-k
 # ── Re-ranker (runs locally, ~80 MB) ──────────────────────────────────────
 RERANKER_MODEL_NAME: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 RERANKER_TOP_N: int = 4         # documents surviving re-ranking
+
+# ── Search signal thresholds ───────────────────────────────────────────────
+MIN_PREV_QUERY_LENGTH: int = 15   # min length of previous query to include in search signal
+MIN_CURRENT_QUERY_LENGTH: int = 10  # below this, always augment with previous query
+
+# ── Semantic cache ─────────────────────────────────────────────────────────
+SEMANTIC_CACHE_THRESHOLD: float = 0.70    # cosine similarity to reuse cached docs
+PINNED_RELEVANCE_THRESHOLD: float = 0.40  # min similarity to inject pinned file
+
+# ── Ghost history ──────────────────────────────────────────────────────────
+GHOST_HISTORY_WINDOW: int = 8             # recent messages to keep in full
+GHOST_HISTORY_MAX: int = 10               # beyond this, truncate with ghost logic
+AI_RESPONSE_MAX_CHARS: int = 500          # max chars per AI message in ghost history
+
+# ── Sentinel History Cache ─────────────────────────────────────────────────
+SENTINEL_INTERVAL: int = 5                # summarize every N conversation turns
+SENTINEL_MAX_TOKENS: int = 500            # max tokens for the state-block summary
+
+# ── Cross-Provider Cache Config ────────────────────────────────────────────
+# Provider-specific cache checkpoint limits and minimum token thresholds.
+# {provider_pattern: (max_checkpoints, min_tokens_for_cache_write)}
+PROVIDER_CACHE_PROFILES: dict[str, tuple[int, int]] = {
+    "claude-3":    (4, 1024),    # Anthropic: 4 breakpoints, 1024 min
+    "gemini-2.0":  (8, 1028),    # Gemini: more checkpoints, 1028 min
+    "deepseek":    (4, 1024),    # DeepSeek: similar to Claude
+    "qwen-3":      (4, 1024),    # Qwen: similar to Claude
+}
+
+# ── Hybrid Search ──────────────────────────────────────────────────────────
+ENABLE_HYBRID_SEARCH: bool = True         # BM25 + vector combined
+BM25_WEIGHT: float = 0.3                  # weight for keyword search
+VECTOR_WEIGHT: float = 0.7               # weight for semantic search
 
 # ── Supported code extensions ───────────────────────────────────────────────
 CODE_EXTENSIONS: list[str] = [

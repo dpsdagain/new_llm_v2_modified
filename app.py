@@ -30,8 +30,16 @@ from backend import (
     get_collection_info,
     delete_collection,
 )
-from rag_chain import build_rag_chain, OLLAMA_PREFIX
-from config import GEMINI_MODEL, QWEN_MODEL, OLLAMA_MODELS
+from rag_chain import (
+    build_rag_chain, OLLAMA_PREFIX, get_reranking_retriever,
+    rewrite_query_with_context, is_semantic_lock_query,
+)
+from config import (
+    DEFAULT_MODEL, CLOUDROUTER_MODELS, OLLAMA_MODELS,
+    SEMANTIC_CACHE_THRESHOLD, PINNED_RELEVANCE_THRESHOLD,
+    GHOST_HISTORY_WINDOW, GHOST_HISTORY_MAX, AI_RESPONSE_MAX_CHARS,
+    RERANKER_TOP_N,
+)
 from langchain_core.messages import HumanMessage, AIMessage
 
 
@@ -118,7 +126,7 @@ if "active_collection" not in st.session_state:
 if "rag_chain" not in st.session_state:
     st.session_state.rag_chain = None
 if "model_id" not in st.session_state:
-    st.session_state.model_id = GEMINI_MODEL
+    st.session_state.model_id = DEFAULT_MODEL
 if "pinned_file" not in st.session_state:
     st.session_state.pinned_file = None
 if "pinned_content" not in st.session_state:
@@ -130,13 +138,121 @@ if "last_query_vector" not in st.session_state:
     st.session_state.last_query_vector = None
 if "last_docs" not in st.session_state:
     st.session_state.last_docs = []
-if "cache_stats" not in st.session_state:
-    st.session_state.cache_stats = None
+if "token_usage" not in st.session_state:
+    st.session_state.token_usage = {}
+if "debug_mode" not in st.session_state:
+    st.session_state.debug_mode = False
+if "sentinel_state" not in st.session_state:
+    st.session_state.sentinel_state = ""
+if "filter_extensions" not in st.session_state:
+    st.session_state.filter_extensions = []
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
+
+def extract_usage_metadata(raw_chunk) -> dict:
+    """
+    Intelligently extract token usage across different providers.
+    Supports OpenRouter (Cloud), Gemini, Anthropic-style caching, and Ollama.
+    """
+    if not (raw_chunk and hasattr(raw_chunk, "response_metadata") and raw_chunk.response_metadata):
+        return {}
+    
+    meta = raw_chunk.response_metadata
+    usage = {}
+    
+    # ── 1. Standard OpenAI/OpenRouter 'token_usage' ────────────────────
+    if "token_usage" in meta:
+        tu = meta["token_usage"]
+        usage["input"] = tu.get("prompt_tokens")
+        usage["output"] = tu.get("completion_tokens")
+        usage["total"] = tu.get("total_tokens")
+    
+    # ── 2. Gemini / Generic 'usage' ────────────────────────────────────
+    if "usage" in meta:
+        gu = meta["usage"]
+        if isinstance(gu, dict):
+            usage["input"] = usage.get("input", gu.get("prompt_tokens"))
+            usage["output"] = usage.get("output", gu.get("completion_tokens"))
+            usage["total"] = usage.get("total", gu.get("total_tokens"))
+                
+            # Gemini cached_tokens
+            if "prompt_tokens_details" in gu:
+                details = gu["prompt_tokens_details"]
+                if isinstance(details, dict) and "cached_tokens" in details:
+                    usage["cache_read"] = details["cached_tokens"]
+
+    # ── 3. Anthropic & OpenRouter Hardware headers ─────────────────────
+    cache_read = meta.get("anthropic-ratelimit-input-tokens-cache-read")
+    cache_create = meta.get("anthropic-ratelimit-input-tokens-cache-creation")
+    if cache_read is not None:
+        usage["cache_read"] = usage.get("cache_read", cache_read)
+    if cache_create is not None:
+        usage["cache_create"] = usage.get("cache_create", cache_create)
+
+    # ── 4. Local Ollama ────────────────────────────────────────────────
+    # Ollama often uses these fields directly
+    if not usage.get("input"):
+       usage["input"] = meta.get("prompt_eval_count") or meta.get("input_tokens") or 0
+    if not usage.get("output"):
+       usage["output"] = meta.get("eval_count") or meta.get("output_tokens") or 0
+
+    # 🚀 Final Safety: Ensure no None values sneak through
+    return {k: (v if v is not None else 0) for k, v in usage.items()}
+
+
+def _fetch_generation_usage(generation_id: str) -> dict:
+    """
+    Fetch token usage from OpenRouter's generation endpoint.
+    Called after streaming completes since streaming doesn't return usage.
+    Returns a dict compatible with the telemetry display.
+    """
+    import time
+    import requests
+    from config import OPENROUTER_API_KEY
+
+    if not OPENROUTER_API_KEY:
+        return {}
+
+    # OpenRouter needs a brief delay to finalise the generation record
+    time.sleep(1)
+    url = f"https://openrouter.ai/api/v1/generation?id={generation_id}"
+    try:
+        resp = requests.get(url, headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"}, timeout=5)
+        if resp.status_code != 200:
+            return {}
+        data = resp.json().get("data", {})
+        usage = {
+            "input": data.get("tokens_prompt", 0),
+            "output": data.get("tokens_completion", 0),
+            "total": (data.get("tokens_prompt", 0) + data.get("tokens_completion", 0)),
+        }
+        # Cache tokens (if provider reports them)
+        cached = data.get("tokens_cached", 0)
+        if cached:
+            usage["cache_read"] = cached
+        return usage
+    except Exception:
+        return {}
+
+
+def _truncate_ai_in_history(history: list) -> list:
+    """
+    Cap AI response length in chat history to reduce token waste.
+    Long AI responses in history are truncated to AI_RESPONSE_MAX_CHARS
+    since the LLM only needs the gist, not the full text.
+    """
+    truncated = []
+    for msg in history:
+        if isinstance(msg, AIMessage) and len(msg.content) > AI_RESPONSE_MAX_CHARS:
+            trimmed = msg.content[:AI_RESPONSE_MAX_CHARS] + "\n... [truncated for context efficiency]"
+            truncated.append(AIMessage(content=trimmed))
+        else:
+            truncated.append(msg)
+    return truncated
+
 
 def detect_force_retrieval(query: str, collection_name: str | None) -> bool:
     """
@@ -151,6 +267,7 @@ def detect_force_retrieval(query: str, collection_name: str | None) -> bool:
         
     # Check for file mentions
     try:
+        from backend import get_collection_info
         info = get_collection_info(collection_name)
         sources = [os.path.basename(s).lower() for s in info.get("sources", [])]
         query_lower = query.lower()
@@ -172,32 +289,49 @@ with st.sidebar:
     st.markdown("# 🧠 Knowledge Base")
     
     # ── Model Selection ────────────────────────────────────────────────
+    # ── Model Selection (Categorised) ──────────────────────────────────
     st.markdown("### 🤖 Model Selection")
-    st.caption("**Cloud (OpenRouter)**")
-    model_options = {
-        "Gemini 2.0 Flash (Stable)": GEMINI_MODEL,
-        "Qwen 3.6 Plus (Free)": QWEN_MODEL,
-    }
-    # Add each installed Ollama model
-    for om in OLLAMA_MODELS:
-        model_options[f"Ollama — {om}"] = f"{OLLAMA_PREFIX}{om}"
-
-    # Resolve current index
-    _idx_map = {v: i for i, v in enumerate(model_options.values())}
-    current_idx = _idx_map.get(st.session_state.model_id, 0)
-
-    selected_label = st.radio(
-        "Choose an LLM",
-        options=list(model_options.keys()),
-        index=current_idx,
-        captions=[
-            "Cloud", "Cloud (free)",
-            *["Local" for _ in OLLAMA_MODELS],
-        ],
-        help="Switching models will reset the retrieval chain."
+    
+    # Flatten categories for finding the current model's category
+    model_to_category = {}
+    for cat, models in CLOUDROUTER_MODELS.items():
+        for name, mid in models.items():
+            model_to_category[mid] = (cat, name)
+    
+    # 1. Choose Category
+    categories = list(CLOUDROUTER_MODELS.keys()) + ["Local (Ollama)"]
+    
+    # Determine initial category
+    current_mid = st.session_state.model_id
+    if current_mid.startswith(OLLAMA_PREFIX):
+        initial_cat = "Local (Ollama)"
+    else:
+        initial_cat = model_to_category.get(current_mid, (categories[0], ""))[0]
+    
+    selected_cat = st.selectbox(
+        "Model Tier / Specialisation",
+        options=categories,
+        index=categories.index(initial_cat) if initial_cat in categories else 0
     )
-
-    new_model_id = model_options[selected_label]
+    
+    # 2. Choose Model within Category
+    if selected_cat == "Local (Ollama)":
+        if not OLLAMA_MODELS:
+            st.error("No local models found in config.")
+            new_model_id = DEFAULT_MODEL
+        else:
+            local_options = {m: f"{OLLAMA_PREFIX}{m}" for m in OLLAMA_MODELS}
+            selected_local = st.selectbox("Select local model", options=list(local_options.keys()))
+            new_model_id = local_options[selected_local]
+    else:
+        # Cloud models
+        tier_models = CLOUDROUTER_MODELS[selected_cat]
+        selected_model_name = st.selectbox(
+            f"Select {selected_cat} AI",
+            options=list(tier_models.keys()),
+            index=list(tier_models.values()).index(current_mid) if current_mid in tier_models.values() else 0
+        )
+        new_model_id = tier_models[selected_model_name]
 
     # If model changed, reset the chain
     if new_model_id != st.session_state.model_id:
@@ -206,37 +340,64 @@ with st.sidebar:
         # 🚀 Invalidation: Model change clears the precision cache
         st.session_state.last_query_vector = None
         st.session_state.last_docs = []
-        st.toast(f"Switched to {selected_label}", icon="🤖")
+        st.toast(f"Switched to model: {st.session_state.model_id}", icon="🤖")
 
     st.divider()
 
     # ── Pinned Context (Architecture A) ────────────────────────────────
     st.write("---")
     st.markdown("### 📌 Pinned Context")
-    st.caption("Pin a full file to the cache for 'Total Vision' and 100% cache hits.")
+    st.caption("Pin a full file to the cache for **Total Vision** (Architecture A).")
     
     file_to_pin = st.text_input(
         "Absolute File Path",
-        placeholder="C:\\path\\to\\file.py",
-        help="Paste the full path to the file you want to analyze deeply."
+        placeholder="C:\\path\\to\\file.v",
+        help="Paste the full path to a specific file (e.g., your top-level Verilog module)."
     )
     
-    if st.button("🚀 Pin to Cache"):
-        if os.path.exists(file_to_pin) and os.path.isfile(file_to_pin):
+    if file_to_pin and os.path.exists(file_to_pin):
+        if os.path.isdir(file_to_pin):
+            st.warning("📁 **Directory detected!** Pinned Context is designed for single files. To analyze this entire folder, use the **Ingestion** section below.")
+            
+            # Intelligent Helper: List files in the directory
             try:
-                with open(file_to_pin, "r", encoding="utf-8") as f:
-                    content = f.read()
-                    st.session_state.pinned_file = file_to_pin
-                    st.session_state.pinned_content = f"FILE: {file_to_pin}\n\n{content}"
-                st.success(f"Pinned {os.path.basename(file_to_pin)}!")
+                files = [f for f in os.listdir(file_to_pin) if os.path.isfile(os.path.join(file_to_pin, f))]
+                if files:
+                    selected_subfile = st.selectbox("Pick a specific file to pin:", options=files)
+                    if st.button("🚀 Pin Selected File", use_container_width=True):
+                        full_path = os.path.join(file_to_pin, selected_subfile)
+                        with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                            st.session_state.pinned_file = full_path
+                            st.session_state.pinned_content = f"FILE: {full_path}\n\n{f.read()}"
+                        st.success(f"Pinned {selected_subfile}!")
+                        st.rerun()
+                else:
+                    st.info("No files found in this directory.")
             except Exception as e:
-                st.error(f"Failed to read file: {e}")
-        else:
-            st.error("Invalid file path or file not found.")
+                st.error(f"Error reading directory: {e}")
+            
+            # Quick Ingest Bridge
+            if st.button("⚡ Ingest Folder for RAG Instead", use_container_width=True):
+                st.session_state["pending_folder"] = file_to_pin
+                st.toast("Ready to ingest below!", icon="📂")
+        
+        elif os.path.isfile(file_to_pin):
+            if st.button("🚀 Pin to Cache", use_container_width=True):
+                try:
+                    with open(file_to_pin, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+                        st.session_state.pinned_file = file_to_pin
+                        st.session_state.pinned_content = f"FILE: {file_to_pin}\n\n{content}"
+                    st.success(f"Pinned {os.path.basename(file_to_pin)}!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to read file: {e}")
+    elif file_to_pin:
+        st.error("Invalid file path or file not found.")
 
     if st.session_state.pinned_file:
         st.info(f"✅ Active: **{os.path.basename(st.session_state.pinned_file)}**")
-        if st.button("❌ Unpin"):
+        if st.button("❌ Unpin", use_container_width=True):
             st.session_state.pinned_file = None
             st.session_state.pinned_content = "None pinned."
             st.rerun()
@@ -274,6 +435,7 @@ with st.sidebar:
     st.markdown("### 💻 Ingest Codebase")
     folder_path = st.text_input(
         "Local folder path",
+        value=st.session_state.pop("pending_folder", "") if "pending_folder" in st.session_state else "",
         placeholder=r"C:\Users\HP\my_project",
     )
     if st.button("⚡ Ingest Folder", disabled=not folder_path, use_container_width=True):
@@ -351,13 +513,55 @@ with st.sidebar:
     # ── Clear chat ─────────────────────────────────────────────────────
     if st.button("🗑️ Clear Chat", use_container_width=True):
         st.session_state.chat_history = []
+        st.session_state.sentinel_state = ""
+        st.session_state.last_query_vector = None
+        st.session_state.last_docs = []
         st.rerun()
 
     st.divider()
 
     # ── Developer tools ───────────────────────────────────────────────
     st.markdown("### 🛠️ Developer Tools")
-    debug_mode = st.toggle("Debug Mode", value=False, help="Show retrieval details and reranker scores")
+    st.session_state.debug_mode = st.toggle("Debug Mode", value=st.session_state.debug_mode, help="Show retrieval details and reranker scores")
+
+    st.divider()
+
+    # ── Metadata Filtering (Phase 1b) ────────────────────────────────
+    st.markdown("### 🔍 Retrieval Filters")
+    st.caption("Narrow retrieval to specific file types.")
+    filter_options = [".py", ".js", ".ts", ".java", ".cpp", ".c", ".go",
+                      ".v", ".sv", ".html", ".css", ".md", ".json", ".sql"]
+    selected_filters = st.multiselect(
+        "Filter by extension",
+        options=filter_options,
+        default=[],
+        help="Only retrieve chunks from files with these extensions. Leave empty for all."
+    )
+    st.session_state.filter_extensions = selected_filters if selected_filters else []
+
+    st.divider()
+
+    # ── Summarize-and-Pin (Phase 2b) ─────────────────────────────────
+    st.markdown("### 📝 Summarize & Pin")
+    st.caption("For large files: pin a compact summary instead of the full file.")
+    summarize_path = st.text_input(
+        "File to summarize",
+        placeholder="C:\\path\\to\\large_file.py",
+        key="summarize_path_input",
+    )
+    if summarize_path and os.path.isfile(summarize_path):
+        if st.button("📝 Summarize & Pin", use_container_width=True):
+            from backend import summarize_document_for_pin
+            summary = summarize_document_for_pin(summarize_path, max_chars=3000)
+            if summary:
+                st.session_state.pinned_file = summarize_path
+                st.session_state.pinned_content = (
+                    f"FILE (SUMMARIZED): {summarize_path}\n\n{summary}"
+                )
+                st.success(f"Pinned summary of {os.path.basename(summarize_path)} ({len(summary)} chars vs full file)")
+                st.rerun()
+            else:
+                st.error("Could not generate summary — file may be empty.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -404,9 +608,16 @@ if user_input:
 
     # ── Build or reuse rag_chain ────────────────────────────────────────
     if st.session_state.rag_chain is None:
-        coll = st.session_state.active_collection or "default"
+        coll = st.session_state.active_collection
+        if not coll:
+            coll = "default"
+            st.toast("No collection selected — using 'default'", icon="⚠️")
         db = load_existing_chroma(collection_name=coll)
-        if db is None:
+        
+        # 🚀 Fix: If no DB but we have physical pinned content, we can still chat!
+        has_pinned = st.session_state.get("pinned_file") is not None
+        
+        if db is None and not has_pinned:
             with st.chat_message("assistant"):
                 st.warning(
                     "⚠️ No knowledge base found. "
@@ -414,7 +625,7 @@ if user_input:
                 )
             st.stop()
         try:
-            st.session_state.vector_db = db  # 🚀 Fix: Persist DB for embedding access
+            st.session_state.vector_db = db  # 🚀 Fix: Persist DB for embedding access (may be None)
             st.session_state.rag_chain = build_rag_chain(db, model=st.session_state.model_id)
         except ValueError as e:
             with st.chat_message("assistant"):
@@ -434,85 +645,117 @@ if user_input:
     # ── Stream the response ─────────────────────────────────────────────
     with st.chat_message("assistant"):
         try:
-            # We'll use this to capture the final context/answer for history
             full_response = {"answer": "", "context": []}
+            st.session_state.token_usage = {}
 
             def response_generator():
-                # 🚀 Accuracy-First: HYBRID INTENT GUARD
-                # Detect if we should FORCE a refresh regardless of similarity
+                # ── HYBRID INTENT GUARD ──────────────────────────────────
+                # Detect if we should FORCE a fresh retrieval
                 is_forced = detect_force_retrieval(user_input, st.session_state.active_collection)
-                
+
                 cached_docs = None
                 q_vector = None
-                
+
                 if st.session_state.vector_db and not is_forced:
-                    # 1. Embed query
-                    q_vector = st.session_state.vector_db.embeddings.embed_query(user_input)
-                    
-                    # 2. 🚀 PLATINUM SLIDING WINDOW: Union Retrieval
-                    # We always retrieve fresh docs and merge them with previous context
-                    # to maintain a stable cached prefix while adding new info.
-                    if st.session_state.last_query_vector is not None and st.session_state.last_docs:
-                        sim = np.dot(q_vector, st.session_state.last_query_vector)
-                        
-                        # Only attempt Union if we have some semantic overlap
-                        if sim >= 0.70:
-                            from config import RERANKER_TOP_N
-                            # Perform new retrieval
-                            fresh_docs = st.session_state.vector_db.similarity_search(user_input, k=RERANKER_TOP_N)
-                            
-                            # Intersection: Docs present in both (Stable Prefix)
-                            last_content = [d.page_content for d in st.session_state.last_docs]
-                            intersection = [d for d in st.session_state.last_docs if d.page_content in [f.page_content for f in fresh_docs]]
-                            
-                            # New Chunks: Unique docs from fresh search
-                            new_chunks = [f for f in fresh_docs if f.page_content not in last_content]
-                            
-                            # Construct Union: Intersection first (Cache Stability) + New Chunks
-                            stable_docs = intersection
-                            new_docs = new_chunks[: (RERANKER_TOP_N * 2) - len(intersection)]
-                            
-                            cached_docs = {"stable": stable_docs, "new": new_docs}
-                            
-                            if intersection:
-                                st.toast(f"Reusing {len(intersection)} stable chunks", icon="♻️")
-                
-                # 🚀 Accuracy-First: GHOST HISTORY
-                if len(lc_history) <= 10:
-                    truncated_history = lc_history
+                    # 1. SEMANTIC LOCKING: Short follow-ups like "why?",
+                    #    "explain more", "how does it work?" bypass retrieval
+                    #    entirely and reuse the exact previous context.
+                    if (is_semantic_lock_query(user_input)
+                            and st.session_state.last_docs):
+                        cached_docs = {"stable": st.session_state.last_docs, "new": []}
+                        st.toast("Semantic lock — reusing exact context (0 retrieval cost)", icon="🔒")
+                    else:
+                        # 2. Embed query for similarity check
+                        q_vector = st.session_state.vector_db.embeddings.embed_query(user_input)
+
+                        # 3. TRUE CACHE SKIP: If follow-up is semantically similar,
+                        #    reuse last docs WITHOUT calling ChromaDB at all.
+                        if st.session_state.last_query_vector is not None and st.session_state.last_docs:
+                            sim = np.dot(q_vector, st.session_state.last_query_vector)
+
+                            if sim >= SEMANTIC_CACHE_THRESHOLD:
+                                cached_docs = {"stable": st.session_state.last_docs, "new": []}
+                                st.toast(
+                                    f"Cache hit (sim={sim:.2f}) — skipped retrieval, reusing {len(st.session_state.last_docs)} chunks",
+                                    icon="⚡"
+                                )
+                        # else: similarity too low, let rag_chain do fresh retrieval
+
+                # ── PINNED FILE RELEVANCE GATE ───────────────────────────
+                # Only inject the pinned file if the query is actually
+                # related to it — otherwise skip to save tokens.
+                pinned_to_send = st.session_state.pinned_content
+                if (st.session_state.pinned_file
+                        and st.session_state.vector_db
+                        and pinned_to_send != "None pinned."):
+                    pinned_vector = st.session_state.vector_db.embeddings.embed_query(
+                        os.path.basename(st.session_state.pinned_file)
+                    )
+                    if q_vector is not None:
+                        pinned_sim = float(np.dot(q_vector, pinned_vector))
+                    else:
+                        # q_vector not computed (no vector_db or forced refresh)
+                        temp_vec = st.session_state.vector_db.embeddings.embed_query(user_input)
+                        pinned_sim = float(np.dot(temp_vec, pinned_vector))
+
+                    if pinned_sim < PINNED_RELEVANCE_THRESHOLD:
+                        pinned_to_send = "None pinned."
+                        st.toast(f"Pinned file skipped (relevance={pinned_sim:.2f})", icon="📌")
+
+                # ── GHOST HISTORY with AI response truncation ────────────
+                if len(lc_history) <= GHOST_HISTORY_MAX:
+                    truncated_history = _truncate_ai_in_history(lc_history)
                 else:
                     anchor = lc_history[:2]
-                    ghosts = [msg for msg in lc_history[2:-8] if isinstance(msg, HumanMessage)]
-                    window = lc_history[-8:]
-                    truncated_history = anchor + ghosts + window
+                    ghosts = [msg for msg in lc_history[2:-GHOST_HISTORY_WINDOW]
+                              if isinstance(msg, HumanMessage)]
+                    window = lc_history[-GHOST_HISTORY_WINDOW:]
+                    truncated_history = _truncate_ai_in_history(anchor + ghosts + window)
                 
                 stream_iter = chain.stream({
-                    "input": user_input, 
+                    "input": user_input,
                     "chat_history": truncated_history,
-                    "full_source_context": st.session_state.pinned_content,
+                    "full_source_context": pinned_to_send,
                     "exclude_file": st.session_state.pinned_file,
-                    "cached_docs": cached_docs
+                    "cached_docs": cached_docs,
+                    "sentinel_state": st.session_state.sentinel_state,
+                    "filter_extensions": st.session_state.filter_extensions or None,
                 })
 
+                generation_id = None
                 for chunk in stream_iter:
-                    # Extract cache metadata if available (OpenRouter/Anthropic)
-                    if hasattr(chunk, "response_metadata") and chunk.response_metadata:
-                        meta = chunk.response_metadata
-                        cache_read = meta.get("anthropic-ratelimit-input-tokens-cache-read")
-                        cache_create = meta.get("anthropic-ratelimit-input-tokens-cache-creation")
-                        if cache_read or cache_create:
-                            st.session_state.cache_stats = {
-                                "read": cache_read,
-                                "created": cache_create
-                            }
+                    raw = chunk.get("raw_chunk")
+                    if raw:
+                        # Try to capture the generation ID for post-stream usage fetch
+                        if hasattr(raw, "response_metadata") and raw.response_metadata:
+                            gen_id = raw.response_metadata.get("id")
+                            if gen_id:
+                                generation_id = gen_id
+                            # Try streaming metadata (may still be empty)
+                            new_usage = extract_usage_metadata(raw)
+                            if new_usage:
+                                st.session_state.token_usage = new_usage
+                            if st.session_state.debug_mode:
+                                st.session_state["debug_meta"] = raw.response_metadata
 
                     if "context" in chunk:
                         full_response["context"] = chunk["context"]
                         st.session_state.last_docs = chunk["context"]
-                        st.session_state.last_query_vector = q_vector
+                        if q_vector is not None:
+                            st.session_state.last_query_vector = q_vector
+                        elif st.session_state.vector_db:
+                            st.session_state.last_query_vector = st.session_state.vector_db.embeddings.embed_query(user_input)
                     if "answer" in chunk:
                         full_response["answer"] += chunk["answer"]
                         yield chunk["answer"]
+
+                # POST-STREAM USAGE FETCH
+                # Streaming returns no usage data, so fetch it from
+                # OpenRouter's /generation endpoint using the generation ID.
+                if generation_id and not st.session_state.token_usage.get("input"):
+                    fetched = _fetch_generation_usage(generation_id)
+                    if fetched:
+                        st.session_state.token_usage = fetched
             
             # Execute streaming
             answer = st.write_stream(response_generator())
@@ -526,10 +769,24 @@ if user_input:
         source_docs = result.get("context", [])
         sources_meta = []
         
-        # 🚀 Cache Usage Transparency
-        if st.session_state.get("cache_stats"):
-            stats = st.session_state.cache_stats
-            st.caption(f"⚡ Cache: **{stats.get('read', 0)}** read | **{stats.get('created', 0)}** created")
+        # 🚀 Telemetry: Token Usage & Caching
+        if st.session_state.get("token_usage"):
+            usage = st.session_state.token_usage
+            u_in = usage.get("input") or 0
+            u_out = usage.get("output") or 0
+            u_total = usage.get("total") or (u_in + u_out)
+            c_read = usage.get("cache_read") or 0
+            
+            telemetry = f"📥 **{u_in}** In | 🤖 **{u_out}** AI | 📊 **{u_total}** Total"
+            if c_read > 0:
+                telemetry += f" | ⚡ **{c_read}** Cached"
+            
+            st.caption(telemetry)
+            
+            # Show Debug Info if enabled
+            if st.session_state.debug_mode and st.session_state.get("debug_meta"):
+                with st.expander("🐞 Debug Metadata"):
+                    st.json(st.session_state.debug_meta)
 
         if source_docs:
             with st.expander("📚 Source Documents"):
@@ -543,7 +800,7 @@ if user_input:
                     })
 
         # Debug panel — retrieval details & reranker scores
-        if debug_mode and source_docs:
+        if st.session_state.debug_mode and source_docs:
             with st.expander("🛠️ Debug: Retrieval Details", expanded=True):
                 st.markdown(f"**Collection:** `{st.session_state.active_collection}`")
                 st.markdown(f"**Chunks retrieved:** {len(source_docs)}")

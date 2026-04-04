@@ -15,6 +15,8 @@ import hashlib
 import logging
 import os
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import BinaryIO, Callable
 
@@ -229,8 +231,8 @@ def load_and_chunk_codebase(
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _content_hash(doc: Document) -> str:
-    """Return an MD5 hex digest of a document's page_content."""
-    return hashlib.md5(doc.page_content.encode("utf-8")).hexdigest()
+    """Return a SHA-256 hex digest of a document's page_content."""
+    return hashlib.sha256(doc.page_content.encode("utf-8")).hexdigest()
 
 
 def ingest_into_chroma(
@@ -292,9 +294,13 @@ def load_existing_chroma(collection_name: str = "default") -> Chroma | None:
     )
     # Quick sanity check — empty collection means nothing was ingested
     try:
-        count = db._collection.count()
+        data = db.get(limit=1)
+        count = len(data["ids"])
+        if count == 0:
+            # Double-check with full count via get()
+            count = len(db.get()["ids"])
     except Exception:
-        count = len(db.get()["ids"])
+        count = 0
     if count == 0:
         return None
     return db
@@ -339,3 +345,114 @@ def delete_collection(collection_name: str) -> bool:
         return True
     except Exception:
         return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ASYNC INGESTION (Phase 1a)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class AsyncIngestionTask:
+    """
+    Run ingestion (chunking + embedding) in a background thread
+    so the Streamlit UI stays responsive.
+
+    Usage:
+        task = AsyncIngestionTask(chunks, collection_name)
+        task.start()
+        # Poll task.progress, task.is_done, task.result from the UI
+    """
+
+    def __init__(self, documents: list[Document], collection_name: str = "default"):
+        self.documents = documents
+        self.collection_name = collection_name
+        self.progress: float = 0.0          # 0.0 to 1.0
+        self.status: str = "pending"        # pending | running | done | error
+        self.result: tuple | None = None    # (Chroma, added_count) on success
+        self.error: str = ""
+        self._thread: threading.Thread | None = None
+
+    def start(self):
+        """Launch the ingestion in a background thread."""
+        self.status = "running"
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            self.progress = 0.1
+            db, added = ingest_into_chroma(self.documents, self.collection_name)
+            self.progress = 1.0
+            self.result = (db, added)
+            self.status = "done"
+        except Exception as e:
+            self.error = str(e)
+            self.status = "error"
+
+    @property
+    def is_done(self) -> bool:
+        return self.status in ("done", "error")
+
+
+def summarize_document_for_pin(file_path: str, max_chars: int = 3000) -> str:
+    """
+    Context Summarization (Phase 2b): Create a compact summary of
+    a large file for pinning instead of the full content.
+
+    Uses extractive summarization (no LLM call):
+      - For code: extracts function/class signatures + docstrings
+      - For text: extracts first N characters with paragraph boundaries
+    """
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+    except Exception:
+        return ""
+
+    if not content:
+        return ""
+
+    ext = Path(file_path).suffix.lower()
+
+    # Code files: extract signatures
+    if ext in (".py", ".js", ".ts", ".java", ".cpp", ".c", ".go", ".rs"):
+        return _extract_code_signatures(content, max_chars)
+
+    # Text/PDF/markup: extract leading paragraphs
+    paragraphs = content.split("\n\n")
+    summary = ""
+    for para in paragraphs:
+        if len(summary) + len(para) > max_chars:
+            break
+        summary += para + "\n\n"
+    return summary.strip() if summary else content[:max_chars]
+
+
+def _extract_code_signatures(content: str, max_chars: int) -> str:
+    """Extract function/class definitions and docstrings from code."""
+    import re
+    lines = content.split("\n")
+    signatures = []
+    total_len = 0
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        # Match common definition patterns
+        if (stripped.startswith(("def ", "class ", "function ", "func ",
+                                 "export ", "public ", "private ", "async def "))
+                or re.match(r"^(const|let|var)\s+\w+\s*=\s*(async\s+)?\(", stripped)):
+            # Include the signature line
+            signatures.append(line)
+            total_len += len(line)
+            # Include docstring/comment on next line if present
+            if i + 1 < len(lines):
+                next_line = lines[i + 1].strip()
+                if next_line.startswith(('"""', "'''", "//", "/*", "#", "*")):
+                    signatures.append(lines[i + 1])
+                    total_len += len(lines[i + 1])
+            if total_len > max_chars:
+                break
+
+    if not signatures:
+        return content[:max_chars]
+
+    return "\n".join(signatures)
