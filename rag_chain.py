@@ -624,7 +624,7 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         inputs["full_source_context"] = pinned_content if (pinned_content and pinned_content != "None pinned.") else "None pinned."
 
         # 4. Retrieval path (Always Query to prevent Hallucination Trap)
-        cached_input = inputs.get("cached_docs") # This is the context_union from app.py
+        cached_input = inputs.get("cached_docs") # Previous context_union
         
         previous_union = []
         if cached_input:
@@ -634,12 +634,17 @@ def build_rag_chain(db: Chroma, model: str | None = None):
             else:
                 previous_union = cached_input
 
-        # Fresh retrieval with Agentic Rewriting
+        # 🚀 Latency Optimization: If history is empty, it's definitely a NEW topic
+        # Otherwise, check the rewritter only if needed.
         new_retrievals = []
         if db:
-            search_signal = router.rewrite_query(user_input, history) if intent == "FOLLOW-UP" else user_input
             pinned_file = inputs.get("exclude_file")
             ext_filter = inputs.get("filter_extensions")
+            
+            # Use 'rewrite_query' only for follow-ups to save local LLM cycles
+            search_signal = user_input
+            if intent == "FOLLOW-UP" and history:
+                search_signal = router.rewrite_query(user_input, history)
             
             new_retrievals = hybrid_search(
                 db, search_signal,
