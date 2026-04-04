@@ -11,6 +11,7 @@ from __future__ import annotations
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 
+import logging
 from langchain_classic.retrievers import ContextualCompressionRetriever
 from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
@@ -46,7 +47,11 @@ from config import (
     ENABLE_HYBRID_SEARCH,
     BM25_WEIGHT,
     VECTOR_WEIGHT,
+    USE_RERANKER,
+    RERANK_TOP_K,
 )
+
+logger = logging.getLogger(__name__)
 
 # 🚀 Platinum Scaling: Context Window Limits
 MAX_CONTEXT_UNION = 15
@@ -57,8 +62,9 @@ from langchain_core.messages import (
     BaseMessage,
 )
 
+from sentence_transformers import CrossEncoder
 import hashlib
-import os
+import statistics
 import pickle
 from rank_bm25 import BM25Okapi
 from nltk.tokenize import word_tokenize
@@ -286,13 +292,7 @@ class ScoringCrossEncoderReranker(CrossEncoderReranker):
             doc.metadata["reranker_score"] = round(float(score), 4)
             top_docs.append(doc)
         
-        # 🚀 Accuracy-First: HIGHER-RESOLUTION DETERMINSTIC SORT (0.05 Bins)
-        # We group chunks into 0.05-precision bins (0.95, 0.90, 0.85, etc.) 
-        # for sorting. This doubles the precision of the Platinum Standard
-        # while preserving nearly identical prefix stability for caching.
-        top_docs.sort(key=lambda d: (-round(float(d.metadata.get("reranker_score", 0)) * 20) / 20.0, 
-                                     d.metadata.get("source", ""), 
-                                     d.page_content))
+        # 🚀 Accuracy-First: DETERMINISTIC SORT (preserved by union logic)
         return top_docs
 
 
@@ -468,8 +468,27 @@ def _prepare_history_with_cache(history: list[BaseMessage], model: str | None) -
     if not history:
         return history
 
-    # Return plain messages — no cache markers on volatile content
-    return list(history)
+    if not ENABLE_PROMPT_CACHING or not is_cache_capable(model):
+        return list(history)
+
+    # 🚀 Professional Polish: Tail-End Caching
+    # We place a cache_control marker on the last message in history.
+    # This allows the provider to cache the growing conversation body
+    # after the stable system-prompt prefix.
+    processed = list(history)
+    last_msg = processed[-1]
+    if hasattr(last_msg, "content"):
+        # Wrap the content in a cacheable block for supported models (Claude)
+        content = last_msg.content
+        if isinstance(content, str):
+            last_msg.content = [
+                {
+                    "type": "text",
+                    "text": content,
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ]
+    return processed
 
 # 🚀 Professional Polish: Linguistic Logic Gates (History vs Speed)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -483,67 +502,119 @@ def _prepare_history_with_cache(history: list[BaseMessage], model: str | None) -
 # 🚀 Local LLM Orchestrator (Agentic Router)
 # ═══════════════════════════════════════════════════════════════════════════
 
-class AgenticRouter:
+class LocalReRanker:
     """
-    Decoupled decision engine using a fast local LLM (llama3.2:1b)
-    to handle classification, rewriting, and summarization tasks.
+    Local Cross-Encoder "Critic" that re-scores retrieved chunks 
+    to ensure surgical precision before the context is passed to the LLM.
     """
-    def __init__(self, model_name: str = AGENT_ROUTER_MODEL):
-        try:
-            self.llm = get_llm(model=f"{OLLAMA_PREFIX}{model_name}", temperature=0.0, streaming=False)
-        except Exception:
-            self.llm = None
+    def __init__(self):
+        self.model = None
+        self._init_model()
 
-    def classify_intent(self, query: str, history: list[BaseMessage]) -> str:
-        """Classify as NEW topic or FOLLOW-UP with context reuse."""
-        if not self.llm or not history:
-            return "NEW" # conservative fallback
-            
-        context = "\n".join([f"{'User' if isinstance(m, HumanMessage) else 'AI'}: {m.content[:200]}" for m in history[-3:]])
-        prompt = (
-            f"Given the chat history:\n{context}\n\n"
-            f"And the new user prompt: '{query}'\n\n"
-            "Is the new prompt a follow-up to the current topic or a completely NEW topic?\n"
-            "Reply ONLY with 'FOLLOW-UP' or 'NEW'."
-        )
-        try:
-            response = self.llm.invoke(prompt)
-            content = response.content.upper()
-            return "FOLLOW-UP" if "FOLLOW-UP" in content else "NEW"
-        except Exception:
-            return "NEW"
+    def _init_model(self):
+        from config import USE_RERANKER, RERANK_MODEL
+        if USE_RERANKER:
+            try:
+                # This may take a minute to download on first run (~100MB)
+                self.model = CrossEncoder(RERANK_MODEL)
+            except Exception as e:
+                logger.error(f"❌ Re-ranker failed to load: {e}")
+                self.model = None
 
-    def rewrite_query(self, query: str, history: list[BaseMessage]) -> str:
-        """Rewrite a vague follow-up into a standalone search query."""
-        if not self.llm or not history:
-            return query
-            
-        context = "\n".join([f"{'User' if isinstance(m, HumanMessage) else 'AI'}: {m.content[:300]}" for m in history[-2:]])
-        prompt = (
-            f"Chat History:\n{context}\n\n"
-            f"User just said: '{query}'\n\n"
-            "Rewrite this into a standalone search query that includes all necessary context. "
-            "Reply ONLY with the rewritten query."
-        )
-        try:
-            response = self.llm.invoke(prompt)
-            return response.content.strip().strip('"')
-        except Exception:
-            return query
+    def rerank(self, query: str, documents: list[Document], top_k: int) -> list[Document]:
+        """Re-score and filter documents using the Cross-Encoder."""
+        if not self.model or not documents:
+            return documents[:top_k]
 
-    def summarize_state(self, history: list[BaseMessage]) -> str:
-        """Create a dense 3-bullet summary of the conversation state."""
-        if not self.llm:
-            return "None."
-            
-        context = "\n".join([f"{'User' if isinstance(m, HumanMessage) else 'AI'}: {m.content[:500]}" for m in history[-6:]])
-        prompt = (
-            f"History:\n{context}\n\n"
-            "Summarize the conversation state so far in exactly 3 dense bullet points. "
-            "Focus on technical topics discussed. Reply ONLY with the bullet points."
-        )
+        # Prepare pairs for cross-encoding (Query, Chunk)
+        pairs = [[query, doc.page_content] for doc in documents]
         try:
-            response = self.llm.invoke(prompt)
+            scores = self.model.predict(pairs)
+            
+            # Combine scores with docs and sort
+            scored_docs = sorted(zip(scores, documents), key=lambda x: x[0], reverse=True)
+            
+            # 🚀 Phase 5: Store the top score for telemetry
+            self.last_top_score = float(scored_docs[0][0]) if scored_docs else 0.0
+            
+            # Log the top score for telemetry
+            if scored_docs:
+                logger.info(f"🎯 Top Re-rank Relevance Score: {scored_docs[0][0]:.4f}")
+            
+            return [doc for score, doc in scored_docs[:top_k]]
+        except Exception as e:
+            logger.error(f"❌ Re-ranking execution failed: {e}")
+            return documents[:top_k]
+# ═══════════════════════════════════════════════════════════════════════════
+
+class VectorRouter:
+    """
+    Zero-latency decision engine using vector similarity to handle 
+    classification and state management without LLM overhead.
+    """
+    def __init__(self):
+        # We reuse the embedding model already loaded in backend.py
+        pass
+
+    def classify_intent(self, current_similarity: float) -> str:
+        """
+        Classify as NEW topic or FOLLOW-UP using embedding similarity.
+        Threshold 0.6 is a balanced middle-ground for semantic continuation.
+        """
+        if current_similarity >= 0.6:
+            return "FOLLOW-UP"
+        return "NEW"
+
+    def detect_specialty(self, query: str) -> str:
+        """
+        Detect the best specialist for the query using robust regex word boundaries.
+        Returns one of: ['CODE', 'REASONING', 'VISION', 'GENERAL']
+        """
+        import re
+        q = query.lower()
+        
+        # 💻 Coding Specialist Triggers
+        code_triggers = [
+            r"code", r"python", r"javascript", r"verilog", r"function", r"class", 
+            r"refactor", r"bug", r"debug", r"compile", r"script", r"hdl", r"rtl",
+            r"implement", r"write a", r"how to use", r"api", r"library", r"sql", r"html",
+            r"cpp", r"c\+\+", r"rust", r"golang"
+        ]
+        if any(re.search(rf"\b{t}\b", q) for t in code_triggers) or "```" in q:
+            return "CODE"
+            
+        # 🧠 Reasoning / Math Triggers
+        reasoning_triggers = [
+            r"analyze", r"logic", r"math", r"derive", r"prove", r"step by step",
+            r"complex", r"calculate", r"deepseek", r"reason", r"philosophy", 
+            r"compare", r"architecture", r"design pattern", r"explain how"
+        ]
+        if any(re.search(rf"\b{t}\b", q) for t in reasoning_triggers):
+            return "REASONING"
+            
+        # 👁️ Vision Triggers
+        vision_triggers = [r"image", r"plot", r"chart", r"diagram", r"vision", r"see this"]
+        if any(re.search(rf"\b{t}\b", q) for t in vision_triggers):
+            return "VISION"
+            
+        # Default
+        return "GENERAL"
+
+    def summarize_state_fast(self, history: list[BaseMessage]) -> str:
+        """
+        If needed, the LLM can still summarize, but we avoid doing this
+        on every turn. Logic is maintained but decoupled from pre-flight.
+        """
+        # (This remains as an LLM call but is only triggered on intervals)
+        try:
+            llm = get_llm(model=f"{OLLAMA_PREFIX}{AGENT_ROUTER_MODEL}", temperature=0.0, streaming=False)
+            context = "\n".join([f"{'User' if isinstance(m, HumanMessage) else 'AI'}: {m.content[:500]}" for m in history[-6:]])
+            prompt = (
+                f"History:\n{context}\n\n"
+                "Summarize the conversation state so far in exactly 3 dense bullet points. "
+                "Focus on technical topics discussed. Reply ONLY with the bullet points."
+            )
+            response = llm.invoke(prompt)
             return response.content.strip()
         except Exception:
             return "Error generating summary."
@@ -661,10 +732,11 @@ def build_rag_chain(db: Chroma, model: str | None = None):
     # 🚀 Platinum Standard: Metadata-Aware LCEL Chain
     # We remove StrOutputParser to preserve the 'response_metadata' (for caching token counts)
     # inside the raw message chunks.
-    question_answer_chain = prompt | llm
+    # 🚀 Professional Polish: Instantiate Vector Router & Re-ranker
+    router = VectorRouter()
+    reranker = LocalReRanker() if USE_RERANKER else None
 
-    # 🚀 Professional Polish: Instantiate Agentic Router
-    router = AgenticRouter()
+    question_answer_chain = prompt | llm
 
     def _full_context_cache_chain(inputs: dict):
         """
@@ -680,24 +752,21 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         last_query_emb = inputs.get("last_query_embedding")
         force_retrieval = inputs.get("force_retrieval", False)
 
-        # 1. 🤖 Parallel Agentic Orchestration ──────────────────────────────
-        # We run classification and summarization (if needed) concurrently
-        # to reduce pre-flight latency.
+        # 1. 🤖 Context Awareness (Latency-Free) ──────────────────────────────
         existing_sentinel = inputs.get("sentinel_state", "")
         turn_count = sum(1 for m in history if isinstance(m, HumanMessage))
 
         # Token-aware sentinel trigger: summarize when history is large enough
-        # to cause context pressure, not on a fixed turn cadence.
         # Rough estimate: 1 token ≈ 4 characters.
         estimated_history_tokens = sum(len(m.content) for m in history) // 4
+        from config import SENTINEL_TOKEN_THRESHOLD, SENTINEL_INTERVAL
         should_summarize = (
             turn_count > 0
             and estimated_history_tokens >= SENTINEL_TOKEN_THRESHOLD
-            and turn_count % SENTINEL_INTERVAL == 0  # still respect interval to avoid every-turn summarization
+            and turn_count % SENTINEL_INTERVAL == 0
         )
 
         # Calculate semantic similarity to last query.
-        # First try the zero-cost exact-match cache to skip embedding entirely.
         current_similarity = 0.0
         current_emb = None
         if last_query_emb and not force_retrieval:
@@ -711,22 +780,25 @@ def build_rag_chain(db: Chroma, model: str | None = None):
                 _exact_match_cache_store(user_input, current_emb)
             current_similarity = calculate_cosine_similarity(current_emb, last_query_emb)
 
-        # 🚀 Semantic Escape Hatch: If similarity is very high, skip agentic routing.
-        # When TRUST_NATIVE_CACHE is enabled, we never skip retrieval —
-        # instead we always retrieve and let deterministic sorting + the
-        # provider-side cache handle cost.  This avoids the hallucination
-        # risk of serving stale cached docs on subtle topic shifts.
+        # 🚀 Semantic Escape Hatch (with Native Cache override)
+        from config import SEMANTIC_CACHE_THRESHOLD, STRICT_SEMANTIC_THRESHOLD
+        
+        is_strict_hit = (
+            current_similarity >= STRICT_SEMANTIC_THRESHOLD
+            and not force_retrieval
+        )
         is_semantic_hit = (
             current_similarity >= SEMANTIC_CACHE_THRESHOLD
             and not TRUST_NATIVE_CACHE
         )
         
         # 3. Pinned context passthrough with Relevance Gate
-        from config import PINNED_RELEVANCE_THRESHOLD
-
+        from config import PINNED_RELEVANCE_THRESHOLD, STICKY_PINNED_CONTEXT
         pinned_eligible = False
         if pinned_content and pinned_content != "None pinned.":
-            if current_emb:
+            if STICKY_PINNED_CONTEXT:
+                pinned_eligible = True
+            elif current_emb:
                 pinned_emb = _get_pinned_embedding(pinned_content)
                 pinned_sim = calculate_cosine_similarity(current_emb, pinned_emb)
                 if pinned_sim >= PINNED_RELEVANCE_THRESHOLD:
@@ -736,7 +808,7 @@ def build_rag_chain(db: Chroma, model: str | None = None):
 
         inputs["full_source_context"] = pinned_content if pinned_eligible else "None pinned (irrelevant to current query)."
 
-        # 4. Retrieval path — with Speculative Execution
+        # 4. Define Previous Context Union
         cached_input = inputs.get("cached_docs")
         previous_union = []
         if cached_input:
@@ -745,83 +817,59 @@ def build_rag_chain(db: Chroma, model: str | None = None):
             else:
                 previous_union = cached_input
 
-        new_retrievals = []
+        # 5. 🤖 Zero-Latency Vector Routing & Specialist Detection ─────────
+        # We classify intent based on semantic similarity to avoid LLM latency.
+        intent = router.classify_intent(current_similarity) if history else "NEW"
+        
+        # Phase 4: Specialist Detection
+        enable_auto = inputs.get("auto_specialist", config.ENABLE_AUTO_SPECIALIST)
+        from config import SPECIALIST_MAPPING
+        specialty = router.detect_specialty(user_input) if enable_auto else "GENERAL"
+        specialist_model = SPECIALIST_MAPPING.get(specialty) if enable_auto else None
 
-        # 🚀 PERFORMANCE: Skip retrieval if semantic hit
-        if is_semantic_hit and previous_union:
+        # Sentinel summarisation still uses LLM but only on intervals.
+        if should_summarize:
+            inputs["sentinel_state"] = router.summarize_state_fast(history)
+        else:
+            inputs["sentinel_state"] = existing_sentinel
+
+        # 🚀 PERFORMANCE: Skip retrieval if semantic cache hit
+        # Note: If TRUST_NATIVE_CACHE=True (in config), is_semantic_hit is always False.
+        if is_strict_hit and previous_union:
+            final_docs = previous_union
+            intent = "STRICT-HIT"
+        elif is_semantic_hit and previous_union:
             final_docs = previous_union
             intent = "SEMANTIC-HIT"
         else:
             pinned_file = inputs.get("exclude_file")
             ext_filter = inputs.get("filter_extensions")
 
-            # ── Speculative Execution ──────────────────────────────────────
-            # Run hybrid_search CONCURRENTLY with classify_intent so the
-            # 1–3 s local LLM latency is completely masked.
-            # The speculative search uses the original user_input.
-            # If the router later decides to rewrite the query (rare:
-            # FOLLOW-UP + similarity < 0.6), we discard the speculative
-            # result and re-search with the rewritten query.
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                # A. Intent classification (local LLM)
-                intent_future = None
-                if not is_semantic_hit:
-                    intent_future = executor.submit(
-                        router.classify_intent, user_input, history,
-                    )
+            # 2. Hybrid search (ChromaDB + BM25)
+            # We fetch a larger candidate pool if re-ranking is enabled.
+            from config import RERANK_CANDIDATES, RERANK_TOP_K, RETRIEVER_K
+            k_fetch = RERANK_CANDIDATES if USE_RERANKER else RETRIEVER_K
 
-                # B. Sentinel summarisation (local LLM, conditional)
-                summary_future = None
-                if should_summarize:
-                    summary_future = executor.submit(
-                        router.summarize_state, history,
-                    )
-
-                # C. Speculative hybrid search (ChromaDB + BM25)
-                speculative_future = None
-                if db and not is_semantic_hit:
-                    search_emb = current_emb  # reuse pre-computed embedding
-                    speculative_future = executor.submit(
-                        hybrid_search,
-                        db, user_input,
-                        collection_name=coll_name,
-                        k=RETRIEVER_K,
-                        exclude_file=pinned_file,
-                        filter_extensions=ext_filter,
-                        query_embedding=search_emb,
-                    )
-
-                # Await results
-                intent = intent_future.result() if intent_future else "FOLLOW-UP"
-                if summary_future:
-                    inputs["sentinel_state"] = summary_future.result()
-                else:
-                    inputs["sentinel_state"] = existing_sentinel
-
-                speculative_docs = (
-                    speculative_future.result() if speculative_future else []
-                )
-
-            # ── Post-Speculation Decision ──────────────────────────────────
-            # If a query rewrite is needed, the speculative results are
-            # based on the wrong query string — discard and re-search.
-            needs_rewrite = (
-                intent == "FOLLOW-UP"
-                and history
-                and current_similarity < 0.6
-            )
-            if needs_rewrite and db:
-                rewritten = router.rewrite_query(user_input, history)
+            new_retrievals = []
+            if db:
                 new_retrievals = hybrid_search(
-                    db, rewritten,
+                    db, user_input,
                     collection_name=coll_name,
-                    k=RETRIEVER_K,
+                    k=k_fetch,
                     exclude_file=pinned_file,
                     filter_extensions=ext_filter,
-                    # Can't reuse embedding — query string changed
+                    query_embedding=current_emb,
                 )
-            else:
-                new_retrievals = speculative_docs
+            
+            # 3. 🎯 Local Re-ranking (Phase 3) ──────────────────────────────
+            if USE_RERANKER and reranker and new_retrievals:
+                new_retrievals = reranker.rerank(
+                    user_input, 
+                    new_retrievals, 
+                    top_k=RERANK_TOP_K
+                )
+                # 🚀 Phase 5: Capture the top relevance score for telemetry
+                reranker_score = getattr(reranker, 'last_top_score', 0.0)
 
             # 🤖 Intent-Aware Union Logic
             if intent == "FOLLOW-UP":
@@ -857,6 +905,17 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         inputs["context"] = sorted_docs
         inputs["chat_history"] = _prepare_history_with_cache(history, model)
         
+        # Phase 4: Dynamic Specialist Swap
+        active_llm = question_answer_chain.bound if hasattr(question_answer_chain, "bound") else question_answer_chain
+        if enable_auto and specialist_model:
+            # We only swap if the specialist is different from the current model
+            # to avoid redundant initialization.
+            current_m = getattr(active_llm, "model_name", "")
+            if specialist_model != current_m:
+                active_llm = get_llm(model=specialist_model, streaming=True)
+                # Re-bind the chain with the new specialist
+                question_answer_chain = prompt | active_llm
+        
         # Ensure we always have an embedding to pass back for next turn.
         # On the first turn (no last_query_emb), compute it now so the
         # semantic cache can function starting from turn 2.
@@ -868,7 +927,13 @@ def build_rag_chain(db: Chroma, model: str | None = None):
                 current_emb = get_embedding_model().embed_query(user_input)
                 _exact_match_cache_store(user_input, current_emb)
 
-        yield {"context": inputs["context"], "intent": intent, "query_embedding": current_emb}
+        yield {
+            "context": inputs["context"], 
+            "intent": intent, 
+            "query_embedding": current_emb,
+            "specialist_active": specialist_model if enable_auto else None,
+            "top_relevance_score": reranker_score if 'reranker_score' in locals() else 0.0
+        }
         
         for chunk in question_answer_chain.stream(inputs):
             content = chunk.content if hasattr(chunk, "content") else str(chunk)

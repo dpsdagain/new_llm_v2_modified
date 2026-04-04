@@ -33,9 +33,10 @@ from backend import (
 from rag_chain import build_rag_chain, OLLAMA_PREFIX, get_reranking_retriever
 from config import (
     DEFAULT_MODEL, CLOUDROUTER_MODELS, OLLAMA_MODELS,
+    MIN_CURRENT_QUERY_LENGTH,
     SEMANTIC_CACHE_THRESHOLD, PINNED_RELEVANCE_THRESHOLD,
     GHOST_HISTORY_WINDOW, GHOST_HISTORY_MAX, AI_RESPONSE_MAX_CHARS,
-    RERANKER_TOP_N,
+    RERANKER_TOP_N, ENABLE_AUTO_SPECIALIST,
 )
 from langchain_core.messages import HumanMessage, AIMessage
 
@@ -135,6 +136,10 @@ if "last_docs" not in st.session_state:
     st.session_state.last_docs = []
 if "token_usage" not in st.session_state:
     st.session_state.token_usage = {}
+if "metrics_history" not in st.session_state:
+    st.session_state.metrics_history = []
+if "specialist_counts" not in st.session_state:
+    st.session_state.specialist_counts = {"CODE": 0, "REASONING": 0, "VISION": 0, "GENERAL": 0}
 if "last_query_embedding" not in st.session_state:
     st.session_state.last_query_embedding = None
 if "debug_mode" not in st.session_state:
@@ -350,6 +355,16 @@ with st.sidebar:
         st.session_state.last_docs = []
         st.session_state.last_query_embedding = None
         st.toast(f"Switched to model: {st.session_state.model_id}", icon="🤖")
+
+    # 🛠️ Phase 4: Auto-Specialist Agent
+    from config import ENABLE_AUTO_SPECIALIST as _DEFAULT_AUTO
+    st.session_state.auto_specialist = st.toggle(
+        "🤖 Auto-Specialist Agent",
+        value=st.session_state.get("auto_specialist", _DEFAULT_AUTO),
+        help="Automatically switch to the best model for code, reasoning, or general tasks."
+    )
+    if st.session_state.auto_specialist:
+        st.caption("✨ *Orchestrating the best models for your query...*")
 
     st.divider()
 
@@ -586,7 +601,32 @@ with st.sidebar:
 #  MAIN AREA — Chat Interface
 # ═══════════════════════════════════════════════════════════════════════════
 
-st.markdown("# 🤖 Private AI Knowledge Base & Code Assistant")
+# 📊 Phase 5: Universal Telemetry Dashboard
+with st.sidebar.expander("📊 Live Performance Insights", expanded=False):
+    if not st.session_state.metrics_history:
+        st.info("Run a query to see live performance data.")
+    else:
+        import pandas as pd
+        df = pd.DataFrame(st.session_state.metrics_history)
+        
+        # 1. Savings Chart
+        st.write("**Cumulative Token Savings**")
+        df["Cumulative Cached"] = df["cached_tokens"].cumsum()
+        st.area_chart(df, y="Cumulative Cached", x="turn", use_container_width=True)
+        
+        # 2. Specialist Breakdown
+        st.write("**Specialist Agent Workload**")
+        s_df = pd.DataFrame(list(st.session_state.specialist_counts.items()), columns=["Agent", "Count"])
+        st.bar_chart(s_df, x="Agent", y="Count", use_container_width=True)
+        
+        # 3. Recall Health
+        avg_score = df["relevance_score"].mean()
+        st.metric("Avg Recall Health", f"{avg_score:.2f}", help="Score from local BGE re-ranker (0.0 - 1.0)")
+        st.progress(max(0.0, min(1.0, avg_score)))
+
+st.divider()
+
+# 🤖 Private AI Knowledge Base & Code Assistant
 
 # ── Connection status ──────────────────────────────────────────────────────
 if st.session_state.active_collection:
@@ -727,6 +767,7 @@ if user_input:
                     "collection_name": st.session_state.active_collection or "default",
                     "sentinel_state": st.session_state.sentinel_state,
                     "filter_extensions": st.session_state.filter_extensions or None,
+                    "auto_specialist": st.session_state.auto_specialist,
                 })
 
                 generation_id = None
@@ -740,6 +781,11 @@ if user_input:
                             st.toast("⚡ Semantic Cache Hit: Reusing Context", icon="🔥")
                         else:
                             st.toast("Local LLM: New Concept Detected 🤖", icon="✨")
+
+                    if "specialist_active" in chunk:
+                        specialist = chunk["specialist_active"]
+                        if specialist and specialist != st.session_state.model_id:
+                            st.toast(f"🦾 Specialist Engaged: {specialist}", icon="⚡")
 
                     if "query_embedding" in chunk:
                         st.session_state.last_query_embedding = chunk["query_embedding"]
@@ -763,6 +809,19 @@ if user_input:
                             if new_usage: st.session_state.token_usage = new_usage
                             if st.session_state.debug_mode:
                                 st.session_state["debug_meta"] = raw.response_metadata
+                    
+                    # Phase 5: Capture specialist engagement forpie chart
+                    from config import SPECIALIST_MAPPING
+                    if "specialist_active" in chunk:
+                        spec = chunk["specialist_active"]
+                        for label, m_id in SPECIALIST_MAPPING.items():
+                            if m_id == spec:
+                                st.session_state.specialist_counts[label] += 1
+                                break
+                    
+                    # Phase 5: Capture re-rank score
+                    if "top_relevance_score" in chunk:
+                        st.session_state.last_relevance_score = chunk["top_relevance_score"]
 
                 # POST-STREAM USAGE FETCH
                 if generation_id and not st.session_state.token_usage.get("input") and not st.session_state.model_id.startswith(OLLAMA_PREFIX):
@@ -773,6 +832,16 @@ if user_input:
             # Execute streaming
             answer = st.write_stream(response_generator())
             result = full_response
+            
+            # Phase 5: Commit metrics to history
+            usage = st.session_state.token_usage
+            st.session_state.metrics_history.append({
+                "turn": len(st.session_state.metrics_history) + 1,
+                "input_tokens": usage.get("input", 0),
+                "output_tokens": usage.get("output", 0),
+                "cached_tokens": usage.get("cache_read", 0),
+                "relevance_score": st.session_state.get("last_relevance_score", 0.0)
+            })
             
         except Exception as e:
             st.error(f"❌ LLM error: {e}")

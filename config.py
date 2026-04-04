@@ -91,7 +91,9 @@ MIN_CURRENT_QUERY_LENGTH: int = 10  # below this, always augment with previous q
 
 # ── Semantic cache ─────────────────────────────────────────────────────────
 SEMANTIC_CACHE_THRESHOLD: float = 0.85    # cosine similarity to reuse cached docs
+STRICT_SEMANTIC_THRESHOLD: float = 0.98   # absolute retrieval bypass (no DB call)
 PINNED_RELEVANCE_THRESHOLD: float = 0.40  # min similarity to inject pinned file
+STICKY_PINNED_CONTEXT: bool = True        # preserve cache prefix stability regardless of relevance
 
 # ── Trust Native Cache ────────────────────────────────────────────────────
 # When True, the system ALWAYS retrieves fresh chunks (never skips retrieval
@@ -101,7 +103,7 @@ PINNED_RELEVANCE_THRESHOLD: float = 0.40  # min similarity to inject pinned file
 # you get correct context and avoid hallucination from stale cached docs.
 # Trade-off: slightly higher local compute (BM25 + vector each turn) but
 # eliminates the risk of serving wrong context on subtle topic shifts.
-TRUST_NATIVE_CACHE: bool = False
+TRUST_NATIVE_CACHE: bool = True
 
 # ── Ghost history ──────────────────────────────────────────────────────────
 GHOST_HISTORY_WINDOW: int = 8             # recent messages to keep in full
@@ -121,6 +123,21 @@ PROVIDER_CACHE_PROFILES: dict[str, tuple[int, int]] = {
     "gemini-2.0":  (8, 1028),    # Gemini: more checkpoints, 1028 min
     "deepseek":    (4, 1024),    # DeepSeek: similar to Claude
     "qwen-3":      (4, 1024),    # Qwen: similar to Claude
+}
+
+# 🚀 Phase 3: Relevance Optimization (Re-ranking)
+USE_RERANKER: bool = True
+RERANK_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+RERANK_TOP_K: int = 5
+RERANK_CANDIDATES: int = 15  # fetch more, then re-rank
+
+# 🛠️ Phase 4: Specialist Multi-Model Agents
+ENABLE_AUTO_SPECIALIST: bool = True
+SPECIALIST_MAPPING: dict[str, str] = {
+    "CODE": "qwen/qwen3-coder:free",        # Elite coding specialist
+    "REASONING": "deepseek/deepseek-r1:free", # Deep logic/math specialist
+    "VISION": "qwen/qwen-2.5-vl-7b-instruct:free", # Multimodal specialist
+    "GENERAL": "google/gemini-2.0-flash-001"   # Fast, long-context generalist
 }
 
 # ── Hybrid Search ──────────────────────────────────────────────────────────

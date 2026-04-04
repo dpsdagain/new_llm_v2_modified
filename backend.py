@@ -27,6 +27,11 @@ try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
     nltk.download('punkt')
+
+try:
+    nltk.data.find('tokenizers/punkt_tab')
+except LookupError:
+    nltk.download('punkt_tab')
 from nltk.tokenize import word_tokenize
 
 logger = logging.getLogger(__name__)
@@ -240,14 +245,27 @@ def load_and_chunk_codebase(
             on_progress(idx + 1, total, os.path.basename(fpath))
         ext = Path(fpath).suffix.lower()
         try:
+            # 🚀 Reverting to stable autodetect now that 'chardet' is installed in the venv
             loader = TextLoader(fpath, autodetect_encoding=True)
             raw_docs = loader.load()
             if not raw_docs:
+                # Fallback to UTF-8 if autodetect fails to find content
+                loader = TextLoader(fpath, encoding="utf-8")
+                raw_docs = loader.load()
+            if not raw_docs:
                 continue
             content = raw_docs[0].page_content
-        except Exception as exc:
-            logger.warning("Skipping %s: %s", fpath, exc)
-            continue
+        except Exception:
+            try:
+                # Secondary Fallback: Force UTF-8 if autodetect crashes on certain characters
+                loader = TextLoader(fpath, encoding="utf-8")
+                raw_docs = loader.load()
+                if not raw_docs:
+                    continue
+                content = raw_docs[0].page_content
+            except Exception as exc:
+                logger.warning("Skipping %s: %s", fpath, exc)
+                continue
 
         # ── Zero Chunking (Phase 3 Upgrade) ──────────────────────────────
         if len(content) < ZERO_CHUNK_THRESHOLD:
