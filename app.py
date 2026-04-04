@@ -282,6 +282,17 @@ def detect_force_retrieval(query: str, collection_name: str | None) -> bool:
     return False
 
 
+def get_dynamic_threshold(query_text: str) -> float:
+    """
+    Return a similarity threshold based on the query complexity.
+    Short queries (e.g., 'Why?') need higher precision (0.85).
+    """
+    words = query_text.split()
+    if len(words) < 4:
+        return 0.85 # Strict precision for ambiguous follow-ups
+    return 0.70 # Default semantic flexibility
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  SIDEBAR — Ingestion Controls
 # ═══════════════════════════════════════════════════════════════════════════
@@ -680,7 +691,11 @@ if user_input:
                     try:
                         q_vector = st.session_state.vector_db.embeddings.embed_query(user_input)
                         sim = np.dot(q_vector, st.session_state.last_query_vector)
-                        if sim >= SEMANTIC_CACHE_THRESHOLD:
+                        
+                        # 🚀 Professional Polish: Dynamic Thresholding
+                        threshold = get_dynamic_threshold(user_input)
+                        
+                        if sim >= threshold:
                             cached_docs = {"stable": st.session_state.last_docs, "new": []}
                             st.toast(f"Cache hit (sim={sim:.2f}) — reusing previous context", icon="⚡")
                     except Exception:
@@ -695,7 +710,6 @@ if user_input:
                     anchor = lc_history[:2]
                     ghosts = [msg for msg in lc_history[2:-GHOST_HISTORY_WINDOW] if isinstance(msg, HumanMessage)]
                     window = lc_history[-GHOST_HISTORY_WINDOW:]
-                    from app import _truncate_ai_in_history
                     truncated_history = _truncate_ai_in_history(anchor + ghosts + window)
 
                 stream_iter = chain.stream({

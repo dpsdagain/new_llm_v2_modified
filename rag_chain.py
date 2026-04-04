@@ -8,6 +8,8 @@ Handles:
 """
 
 from __future__ import annotations
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 
 from langchain_classic.retrievers import ContextualCompressionRetriever
 from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
@@ -578,17 +580,28 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         history = inputs.get("chat_history", [])
         coll_name = inputs.get("collection_name", "default")
 
-        # 1. 🤖 Agentic Sentinel: Update conversation state summary
+        # 1. 🤖 Parallel Agentic Orchestration ──────────────────────────────
+        # We run classification and summarization (if needed) concurrently
+        # to reduce pre-flight latency.
         existing_sentinel = inputs.get("sentinel_state", "")
         turn_count = sum(1 for m in history if isinstance(m, HumanMessage))
-        
-        if turn_count > 0 and turn_count % SENTINEL_INTERVAL == 0:
-            inputs["sentinel_state"] = router.summarize_state(history)
-        else:
-            inputs["sentinel_state"] = existing_sentinel
+        should_summarize = (turn_count > 0 and turn_count % SENTINEL_INTERVAL == 0)
 
-        # 2. 🤖 Agentic Router: Intent Classification
-        intent = router.classify_intent(user_input, history)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            # Always classify intent
+            intent_future = executor.submit(router.classify_intent, user_input, history)
+            
+            # Conditionally summarize state
+            summary_future = None
+            if should_summarize:
+                summary_future = executor.submit(router.summarize_state, history)
+            
+            # Await results
+            intent = intent_future.result()
+            if summary_future:
+                inputs["sentinel_state"] = summary_future.result()
+            else:
+                inputs["sentinel_state"] = existing_sentinel
         
         # 3. Pinned context passthrough
         inputs["full_source_context"] = pinned_content if (pinned_content and pinned_content != "None pinned.") else "None pinned."

@@ -298,32 +298,50 @@ def _get_bm25_path(collection_name: str) -> str:
 
 def _update_bm25_index(new_docs: list[Document], collection_name: str):
     """
-    Build or update the BM25 index on disk. 
-    Note: For simplicity in this demo, we rebuild from all docs in the collection.
+    Incrementally build or update the BM25 index on disk.
+    This avoids expensive ChromaDB full gets and re-tokenization.
     """
-    db = load_existing_chroma(collection_name)
-    if not db:
-        return
-        
-    all_data = db.get()
-    all_docs = []
-    for content, meta in zip(all_data.get("documents", []), all_data.get("metadatas", [])):
-        all_docs.append(Document(page_content=content, metadata=meta))
+    path = _get_bm25_path(collection_name)
     
+    # ── 1. Load Existing State ──────────────────────────────────────────
+    existing_data = load_bm25_index(collection_name)
+    
+    if existing_data and "tokenized_corpus" in existing_data:
+        all_docs = existing_data["docs"]
+        tokenized_corpus = existing_data["tokenized_corpus"]
+    else:
+        # Initial build or legacy migration: Pull entire collection
+        db = load_existing_chroma(collection_name)
+        if not db:
+            return
+        all_data = db.get()
+        all_docs = []
+        for content, meta in zip(all_data.get("documents", []), all_data.get("metadatas", [])):
+            all_docs.append(Document(page_content=content, metadata=meta or {}))
+        tokenized_corpus = [word_tokenize(doc.page_content.lower()) for doc in all_docs]
+
+    # ── 2. Add New Documents (Strict Parity) ────────────────────────────────
+    # Filter out docs that might already be in the index (based on source/content hash if available)
+    # For now, we trust 'new_docs' are indeed new from the current ingestion task.
+    new_tokenized = []
+    for doc in new_docs:
+        all_docs.append(doc)
+        new_tokenized.append(word_tokenize(doc.page_content.lower()))
+    
+    tokenized_corpus.extend(new_tokenized)
+    
+    # ── 3. Build & Save ────────────────────────────────────────────────
     if not all_docs:
         return
 
-    # Tokenize for BM25
-    tokenized_corpus = [word_tokenize(doc.page_content.lower()) for doc in all_docs]
     bm25 = BM25Okapi(tokenized_corpus)
-    
-    # Save index and the document map (we need to return the same docs)
     payload = {
         "bm25": bm25,
-        "docs": all_docs
+        "docs": all_docs,
+        "tokenized_corpus": tokenized_corpus # 🚀 Saved for next incremental run
     }
     
-    with open(_get_bm25_path(collection_name), "wb") as f:
+    with open(path, "wb") as f:
         pickle.dump(payload, f)
 
 
