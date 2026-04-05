@@ -904,6 +904,10 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         else:
             final_docs = new_retrievals[:MAX_CONTEXT_UNION]
 
+        # If the model doesn't support caching, filter out massive zero-chunks to save cost
+        if not provider_has_cache:
+            final_docs = [d for d in final_docs if not (d.metadata.get("zero_chunk") and len(d.page_content) > 10000)]
+
         # 🚀 Prefix-Preserving Sort: stable docs stay at top, new docs append.
         # This keeps the stable_context byte prefix identical across turns
         # so the provider-side cache (Anthropic/Gemini) gets a hit.

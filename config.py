@@ -74,7 +74,7 @@ PDF_CHUNK_SIZE: int = 1500      # larger chunks for prose documents
 #
 # 500K chars ≈ 125K tokens — safely within Gemini 2.0 Flash (1M context)
 # and Claude 3.5 (200K context).  For smaller-context models, lower this.
-ZERO_CHUNK_THRESHOLD: int = 500000
+ZERO_CHUNK_THRESHOLD: int = 32000
 
 # ── ChromaDB ────────────────────────────────────────────────────────────────
 CHROMA_DB_DIR: str = os.path.join(os.path.dirname(__file__), "chroma_db")
@@ -104,7 +104,7 @@ TRUST_NATIVE_CACHE: bool = True
 # ── Ghost history ──────────────────────────────────────────────────────────
 GHOST_HISTORY_WINDOW: int = 8             # recent messages to keep in full
 GHOST_HISTORY_MAX: int = 10               # beyond this, truncate with ghost logic
-AI_RESPONSE_MAX_CHARS: int = 500          # max chars per AI message in ghost history
+AI_RESPONSE_MAX_CHARS: int = 2000          # max chars per AI message in ghost history
 GHOST_AI_CHARS: int = 200                 # max chars per AI message in the ghost (middle) section
 MAX_HISTORY_TOKENS: int = 2000            # hard token budget for chat history sent to LLM
 
