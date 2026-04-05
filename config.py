@@ -111,7 +111,7 @@ MAX_HISTORY_TOKENS: int = 2000            # hard token budget for chat history s
 # ── Sentinel History Cache ─────────────────────────────────────────────────
 SENTINEL_INTERVAL: int = 5                # summarize every N conversation turns
 SENTINEL_MAX_TOKENS: int = 500            # max tokens for the state-block summary
-SENTINEL_TOKEN_THRESHOLD: int = 3000      # estimated history tokens before forcing a summarization
+SENTINEL_TOKEN_THRESHOLD: int = 999999      # estimated history tokens before forcing a summarization
 
 # ── Cross-Provider Cache Config ────────────────────────────────────────────
 # Provider-specific cache checkpoint limits and minimum token thresholds.

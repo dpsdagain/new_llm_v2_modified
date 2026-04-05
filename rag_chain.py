@@ -685,10 +685,12 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         # cache_control markers to the first ``max_bp`` blocks; the
         # rest are plain text (no wasted cache writes).
         # Stable order: Instructions > Pinned > Sentinel > RAG context.
-        static_system_text = CORE_INSTRUCTIONS + "\n\nFULL SOURCE CONTEXT (PINNED):\n{full_source_context}\n\nCONVERSATION STATE:\n{sentinel_state}"
+        static_system_text = CORE_INSTRUCTIONS
         block_specs = [
             static_system_text,
             "STABLE RAG CONTEXT (DETERMINISTIC):\n{stable_context}",
+            "FULL SOURCE CONTEXT (PINNED):\n{full_source_context}",
+            "CONVERSATION STATE:\n{sentinel_state}"
         ]
         system_blocks = []
         for idx, text in enumerate(block_specs):
@@ -711,9 +713,9 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         # For non-cache models, we still keep the same logical order
         system_text = (
             f"{CORE_INSTRUCTIONS}\n\n"
+            "STABLE RAG CONTEXT (DETERMINISTIC):\n{stable_context}\n\n"
             "FULL SOURCE CONTEXT (PINNED):\n{full_source_context}\n\n"
-            "CONVERSATION STATE:\n{sentinel_state}\n\n"
-            "STABLE RAG CONTEXT (DETERMINISTIC):\n{stable_context}"
+            "CONVERSATION STATE:\n{sentinel_state}"
         )
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_text),
