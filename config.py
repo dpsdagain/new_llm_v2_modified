@@ -92,7 +92,7 @@ MIN_CURRENT_QUERY_LENGTH: int = 10  # below this, always augment with previous q
 # ── Semantic cache ─────────────────────────────────────────────────────────
 SEMANTIC_CACHE_THRESHOLD: float = 0.85    # cosine similarity to reuse cached docs
 PINNED_RELEVANCE_THRESHOLD: float = 0.40  # min similarity to inject pinned file
-STICKY_PINNED_CONTEXT: bool = False       # when False, PINNED_RELEVANCE_THRESHOLD gates injection
+STICKY_PINNED_CONTEXT: bool = True       # when False, PINNED_RELEVANCE_THRESHOLD gates injection
 
 # ── Trust Native Cache ────────────────────────────────────────────────────
 # When True, the system ALWAYS retrieves fresh chunks (never skips retrieval
@@ -111,7 +111,7 @@ MAX_HISTORY_TOKENS: int = 2000            # hard token budget for chat history s
 # ── Sentinel History Cache ─────────────────────────────────────────────────
 SENTINEL_INTERVAL: int = 5                # summarize every N conversation turns
 SENTINEL_MAX_TOKENS: int = 500            # max tokens for the state-block summary
-SENTINEL_TOKEN_THRESHOLD: int = 999999      # estimated history tokens before forcing a summarization
+SENTINEL_TOKEN_THRESHOLD: int = 2000      # estimated history tokens before forcing a summarization
 
 # ── Cross-Provider Cache Config ────────────────────────────────────────────
 # Provider-specific cache checkpoint limits and minimum token thresholds.
@@ -143,7 +143,7 @@ SPECIALIST_MAPPING: dict[str, str] = {
 }
 
 # ── Hybrid Search ──────────────────────────────────────────────────────────
-ENABLE_HYBRID_SEARCH: bool = True         # BM25 + vector combined
+ENABLE_HYBRID_SEARCH: bool = False        # BM25 + vector combined
 BM25_WEIGHT: float = 0.3                  # weight for keyword search
 VECTOR_WEIGHT: float = 0.7               # weight for semantic search
 

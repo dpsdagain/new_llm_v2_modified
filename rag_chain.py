@@ -688,9 +688,10 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         static_system_text = CORE_INSTRUCTIONS
         block_specs = [
             static_system_text,
-            "STABLE RAG CONTEXT (DETERMINISTIC):\n{stable_context}",
             "FULL SOURCE CONTEXT (PINNED):\n{full_source_context}",
-            "CONVERSATION STATE:\n{sentinel_state}"
+            "CONVERSATION STATE:\n{sentinel_state}",
+            "STABLE RAG CONTEXT (DETERMINISTIC):\n{stable_context}",
+            "NEW RAG DISCOVERIES:\n{new_context}"
         ]
         system_blocks = []
         for idx, text in enumerate(block_specs):
@@ -713,9 +714,10 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         # For non-cache models, we still keep the same logical order
         system_text = (
             f"{CORE_INSTRUCTIONS}\n\n"
-            "STABLE RAG CONTEXT (DETERMINISTIC):\n{stable_context}\n\n"
             "FULL SOURCE CONTEXT (PINNED):\n{full_source_context}\n\n"
-            "CONVERSATION STATE:\n{sentinel_state}"
+            "CONVERSATION STATE:\n{sentinel_state}\n\n"
+            "STABLE RAG CONTEXT (DETERMINISTIC):\n{stable_context}\n\n"
+            "NEW RAG DISCOVERIES:\n{new_context}"
         )
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_text),
@@ -895,12 +897,7 @@ def build_rag_chain(db: Chroma, model: str | None = None):
                     seen_hashes.add(h)
 
             # Cap the new retrievals at MAX_CONTEXT_UNION
-            if current_similarity > 0.85:
-                # If it's a tight follow-up, limit the new retrievals to 1 or 2, 
-                # relying mostly on the surviving_old context.
-                unique_new = unique_new[:2] 
-            else:
-                unique_new = unique_new[:MAX_CONTEXT_UNION]
+            unique_new = unique_new[:MAX_CONTEXT_UNION]
             
             # Calculate how many slots are left for the older stable docs
             available_old_slots = MAX_CONTEXT_UNION - len(unique_new)
@@ -923,20 +920,35 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         if not provider_has_cache:
             final_docs = [d for d in final_docs if not (d.metadata.get("zero_chunk") and len(d.page_content) > 10000)]
 
-        # 🚀 Prefix-Preserving Sort: stable docs stay at top, new docs append.
-        # This keeps the stable_context byte prefix identical across turns
-        # so the provider-side cache (Anthropic/Gemini) gets a hit.
+        # 🚀 Split Context: Prefix cache hits on <established_context>, Relevance hits on <new_discoveries>
         stable_hashes = {
             d.metadata.get("content_hash", "")
             for d in previous_union
         } if previous_union and intent == "FOLLOW-UP" else None
-        sorted_docs = _sort_docs_deterministically(final_docs, stable_hashes=stable_hashes)
-        
-        def _format_docs(docs):
-            return "\n\n".join([f"SOURCE: {d.metadata.get('source')}\nCONTENT: {d.page_content}" for d in docs]) if docs else "None."
 
-        inputs["stable_context"] = _format_docs(sorted_docs)
-        inputs["context"] = sorted_docs
+        established_docs = []
+        new_docs = []
+        if stable_hashes:
+            for d in final_docs:
+                if d.metadata.get("content_hash", "") in stable_hashes:
+                    established_docs.append(d)
+                else:
+                    new_docs.append(d)
+        else:
+            new_docs = final_docs
+
+        # Only sort the established context deterministically to preserve identical byte-string
+        established_docs = _sort_docs_deterministically(established_docs, stable_hashes=None)
+
+        def _format_docs(docs):
+            return "\n\n".join([f"SOURCE: {d.metadata.get('source')}\nCONTENT: {d.page_content}" for d in docs]) if docs else ""
+
+        stable_block = _format_docs(established_docs)
+        new_block = _format_docs(new_docs)
+
+        inputs["stable_context"] = f"<established_context>\n{stable_block}\n</established_context>" if stable_block else "None previously established."
+        inputs["new_context"] = f"<new_discoveries>\n{new_block}\n</new_discoveries>" if new_block else "No new discoveries."
+        inputs["context"] = established_docs + new_docs
         inputs["chat_history"] = _prepare_history_with_cache(history, model)
         
         # Dynamic Specialist Swap — cached LLM instances

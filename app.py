@@ -253,14 +253,22 @@ def _fetch_generation_usage(generation_id: str) -> dict:
 
 def _truncate_ai_in_history(history: list) -> list:
     """
-    Cap AI response length in chat history to reduce token waste.
-    Long AI responses in history are truncated to AI_RESPONSE_MAX_CHARS
-    since the LLM only needs the gist, not the full text.
+    Cap AI response length in chat history to reduce token waste,
+    while aggressively preserving code blocks so the LLM remembers
+    the actual code it wrote.
     """
+    import re
     truncated = []
     for msg in history:
         if isinstance(msg, AIMessage) and len(msg.content) > AI_RESPONSE_MAX_CHARS:
-            trimmed = msg.content[:AI_RESPONSE_MAX_CHARS] + "\n... [truncated for context efficiency]"
+            code_blocks = re.findall(r"(```.*?```)", msg.content, flags=re.DOTALL)
+            if code_blocks:
+                gist = msg.content[:400]
+                trimmed = f"{gist}\n... [prose truncated]\n\n" + "\n\n".join(code_blocks)
+                if len(trimmed) > AI_RESPONSE_MAX_CHARS * 3:
+                    trimmed = trimmed[:AI_RESPONSE_MAX_CHARS * 3] + "\n```\n... [code truncated]"
+            else:
+                trimmed = msg.content[:AI_RESPONSE_MAX_CHARS] + "\n... [truncated for context efficiency]"
             truncated.append(AIMessage(content=trimmed))
         else:
             truncated.append(msg)
