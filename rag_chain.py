@@ -847,16 +847,26 @@ def build_rag_chain(db: Chroma, model: str | None = None):
             and not force_retrieval
         )
 
+        search_query = user_input
+        if intent == "FOLLOW-UP":
+            try:
+                # Use your existing fast router model to rewrite the query
+                llm_rewrite = get_llm(model=f"{OLLAMA_PREFIX}{AGENT_ROUTER_MODEL}", temperature=0.0, streaming=False)
+                prompt_rewrite = f"Given chat history: {history[-2:]}\nRewrite this query to be standalone: '{user_input}'"
+                search_query = llm_rewrite.invoke(prompt_rewrite).content.strip()
+            except Exception:
+                pass # Fallback to original
+
         reranker_score = 0.0
         new_retrievals = []
         if not skip_retrieval and db:
             new_retrievals = hybrid_search(
-                db, user_input,
+                db, search_query,
                 collection_name=coll_name,
                 k=k_fetch,
                 exclude_file=pinned_file,
                 filter_extensions=ext_filter,
-                query_embedding=current_emb,
+                query_embedding=current_emb if search_query == user_input else None,
             )
         elif skip_retrieval:
             # Semantic cache hit — reuse previous docs as the fresh set.
