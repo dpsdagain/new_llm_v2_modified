@@ -685,11 +685,9 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         # cache_control markers to the first ``max_bp`` blocks; the
         # rest are plain text (no wasted cache writes).
         # Stable order: Instructions > Pinned > Sentinel > RAG context.
+        static_system_text = CORE_INSTRUCTIONS + "\n\nFULL SOURCE CONTEXT (PINNED):\n{full_source_context}\n\nCONVERSATION STATE:\n{sentinel_state}"
         block_specs = [
-            # (label/template, most stable first)
-            CORE_INSTRUCTIONS,
-            "FULL SOURCE CONTEXT (PINNED):\n{full_source_context}",
-            "CONVERSATION STATE:\n{sentinel_state}",
+            static_system_text,
             "STABLE RAG CONTEXT (DETERMINISTIC):\n{stable_context}",
         ]
         system_blocks = []
@@ -895,7 +893,12 @@ def build_rag_chain(db: Chroma, model: str | None = None):
                     seen_hashes.add(h)
 
             # Cap the new retrievals at MAX_CONTEXT_UNION
-            unique_new = unique_new[:MAX_CONTEXT_UNION]
+            if current_similarity > 0.85:
+                # If it's a tight follow-up, limit the new retrievals to 1 or 2, 
+                # relying mostly on the surviving_old context.
+                unique_new = unique_new[:2] 
+            else:
+                unique_new = unique_new[:MAX_CONTEXT_UNION]
             
             # Calculate how many slots are left for the older stable docs
             available_old_slots = MAX_CONTEXT_UNION - len(unique_new)

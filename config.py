@@ -74,7 +74,7 @@ PDF_CHUNK_SIZE: int = 1500      # larger chunks for prose documents
 #
 # 500K chars ≈ 125K tokens — safely within Gemini 2.0 Flash (1M context)
 # and Claude 3.5 (200K context).  For smaller-context models, lower this.
-ZERO_CHUNK_THRESHOLD: int = 8000
+ZERO_CHUNK_THRESHOLD: int = 4000
 
 # ── ChromaDB ────────────────────────────────────────────────────────────────
 CHROMA_DB_DIR: str = os.path.join(os.path.dirname(__file__), "chroma_db")
