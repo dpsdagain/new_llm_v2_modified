@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 import re
-import numpy as np
 import streamlit as st
 
 # ── Must be the very first Streamlit call ───────────────────────────────────
@@ -22,7 +21,6 @@ st.set_page_config(
 
 # Now safe to import project modules (they may print / use st.cache)
 from backend import (
-    load_and_chunk_pdf_upload,
     load_and_chunk_codebase,
     ingest_into_chroma,
     load_existing_chroma,
@@ -30,13 +28,13 @@ from backend import (
     get_collection_info,
     delete_collection,
 )
-from rag_chain import build_rag_chain, OLLAMA_PREFIX, get_reranking_retriever
+from rag_chain import build_rag_chain, OLLAMA_PREFIX
 from config import (
     DEFAULT_MODEL, CLOUDROUTER_MODELS, OLLAMA_MODELS,
-    MIN_CURRENT_QUERY_LENGTH,
     SEMANTIC_CACHE_THRESHOLD, PINNED_RELEVANCE_THRESHOLD,
     GHOST_HISTORY_WINDOW, GHOST_HISTORY_MAX, AI_RESPONSE_MAX_CHARS,
-    RERANKER_TOP_N, ENABLE_AUTO_SPECIALIST,
+    GHOST_AI_CHARS, MAX_HISTORY_TOKENS,
+    ENABLE_AUTO_SPECIALIST,
 )
 from langchain_core.messages import HumanMessage, AIMessage
 
@@ -152,8 +150,6 @@ if "sentinel_state" not in st.session_state:
     st.session_state.sentinel_state = "No summary generated yet."
 if "sentinel_future" not in st.session_state:
     st.session_state.sentinel_future = None
-if "sentinel_state" not in st.session_state:
-    st.session_state.sentinel_state = ""
 if "filter_extensions" not in st.session_state:
     st.session_state.filter_extensions = []
 
@@ -179,6 +175,11 @@ def extract_usage_metadata(raw_chunk) -> dict:
         usage["input"] = tu.get("prompt_tokens")
         usage["output"] = tu.get("completion_tokens")
         usage["total"] = tu.get("total_tokens")
+        # OpenRouter sometimes puts cached tokens here
+        if "prompt_tokens_details" in tu:
+            details = tu["prompt_tokens_details"]
+            if isinstance(details, dict) and "cached_tokens" in details:
+                usage["cache_read"] = details["cached_tokens"]
     
     # ── 2. Gemini / Generic 'usage' ────────────────────────────────────
     if "usage" in meta:
@@ -195,29 +196,33 @@ def extract_usage_metadata(raw_chunk) -> dict:
                     usage["cache_read"] = details["cached_tokens"]
 
     # ── 3. Anthropic & OpenRouter Hardware headers ─────────────────────
-    cache_read = meta.get("anthropic-ratelimit-input-tokens-cache-read")
-    cache_create = meta.get("anthropic-ratelimit-input-tokens-cache-creation")
+    # Check both direct metadata and common provider-specific headers
+    cache_read = (meta.get("anthropic-ratelimit-input-tokens-cache-read") or 
+                  meta.get("cache_read_tokens") or 
+                  meta.get("tokens_cached"))
+    
+    cache_create = (meta.get("anthropic-ratelimit-input-tokens-cache-creation") or 
+                    meta.get("cache_creation_tokens"))
+                    
     if cache_read is not None:
         usage["cache_read"] = usage.get("cache_read", cache_read)
     if cache_create is not None:
         usage["cache_create"] = usage.get("cache_create", cache_create)
 
     # ── 4. Local Ollama ────────────────────────────────────────────────
-    # Ollama often uses these fields directly
     if not usage.get("input"):
        usage["input"] = meta.get("prompt_eval_count") or meta.get("input_tokens") or 0
     if not usage.get("output"):
        usage["output"] = meta.get("eval_count") or meta.get("output_tokens") or 0
 
-    # 🚀 Final Safety: Ensure no None values sneak through
     return {k: (v if v is not None else 0) for k, v in usage.items()}
 
 
 def _fetch_generation_usage(generation_id: str) -> dict:
     """
     Fetch token usage from OpenRouter's generation endpoint.
-    Called after streaming completes since streaming doesn't return usage.
-    Returns a dict compatible with the telemetry display.
+    Waits 1 second for OpenRouter to finalise the record, then fetches.
+    This runs in a background thread so the UI is never blocked.
     """
     import time
     import requests
@@ -226,8 +231,7 @@ def _fetch_generation_usage(generation_id: str) -> dict:
     if not OPENROUTER_API_KEY:
         return {}
 
-    # OpenRouter needs a brief delay to finalise the generation record
-    time.sleep(1)
+    time.sleep(1)  # OpenRouter needs a moment to finalize the record
     url = f"https://openrouter.ai/api/v1/generation?id={generation_id}"
     try:
         resp = requests.get(url, headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"}, timeout=5)
@@ -239,7 +243,6 @@ def _fetch_generation_usage(generation_id: str) -> dict:
             "output": data.get("tokens_completion", 0),
             "total": (data.get("tokens_prompt", 0) + data.get("tokens_completion", 0)),
         }
-        # Cache tokens (if provider reports them)
         cached = data.get("tokens_cached", 0)
         if cached:
             usage["cache_read"] = cached
@@ -268,31 +271,40 @@ def detect_force_retrieval(query: str, collection_name: str | None) -> bool:
     """
     Detect if the user is explicitly forcing a refresh or mentioning a specific file.
     Uses regex for word-boundary matching to avoid false positives on common substrings.
+
+    The source-file list is cached in session state per collection so that
+    ChromaDB is not scanned on every single query turn.
     """
     import re
     force_words = ["refresh", "reload", "force", "update", "latest", "re-retrieve"]
     query_lower = query.lower()
-    
-    # ── 1. Check for force keywords ────────────────────────────────────
+
+    # 1. Check for force keywords
     for word in force_words:
         if re.search(rf"\b{re.escape(word)}\b", query_lower):
             return True
-    
+
     if not collection_name:
         return False
-        
-    # ── 2. Check for specific file mentions ────────────────────────────
-    try:
-        from backend import get_collection_info
-        info = get_collection_info(collection_name)
-        sources = [os.path.basename(s).lower() for s in info.get("sources", [])]
-        for src in sources:
-            # Match exact filename with word boundaries
-            if re.search(rf"\b{re.escape(src)}\b", query_lower):
-                return True
-    except Exception:
-        pass
-        
+
+    # 2. Check for specific file mentions using a cached source list.
+    #    The cache is keyed by collection name and is invalidated when
+    #    the active collection changes (handled in the connect/ingest flow).
+    cache_key = f"_source_names_cache_{collection_name}"
+    sources: list[str] = st.session_state.get(cache_key)
+    if sources is None:
+        try:
+            from backend import get_collection_info
+            info = get_collection_info(collection_name)
+            sources = [os.path.basename(s).lower() for s in info.get("sources", [])]
+            st.session_state[cache_key] = sources
+        except Exception:
+            sources = []
+
+    for src in sources:
+        if re.search(rf"\b{re.escape(src)}\b", query_lower):
+            return True
+
     return False
 
 
@@ -498,9 +510,10 @@ with st.sidebar:
             if st.button("🔗 Connect", use_container_width=True):
                 st.session_state.active_collection = chosen
                 st.session_state.rag_chain = None
-                # 🚀 Invalidation: Switching collections clears context
+                # Invalidation: Switching collections clears context + source cache
                 st.session_state.last_docs = []
                 st.session_state.last_query_embedding = None
+                st.session_state.pop(f"_source_names_cache_{chosen}", None)
                 st.success(f"Connected to **{chosen}**")
         with col2:
             if st.button("🗑️ Delete", use_container_width=True):
@@ -668,6 +681,8 @@ if st.session_state.ingestion_task:
         st.session_state.active_collection = task.collection_name
         st.session_state.rag_chain = None
         st.session_state.last_docs = []
+        # Invalidate source cache so detect_force_retrieval rescans
+        st.session_state.pop(f"_source_names_cache_{task.collection_name}", None)
         st.session_state.ingestion_done_processed = True
         # Keep success message visible for a bit
         if st.button("Clear Notification", key="clear_ingest"):
@@ -763,14 +778,39 @@ if user_input:
 
                 pinned_to_send = st.session_state.get("pinned_content", "None pinned.")
                 
-                # Identify history for the chain
-                if len(lc_history) <= GHOST_HISTORY_MAX:
-                    truncated_history = _truncate_ai_in_history(lc_history)
+                # Build history: rely on Sentinel State when available
+                if st.session_state.sentinel_state and st.session_state.sentinel_state != "No summary generated yet.":
+                    # If we have a summary, only keep the immediate context (last 4 messages)
+                    truncated_history = lc_history[-4:]
+                    truncated_history = _truncate_ai_in_history(truncated_history)
                 else:
-                    anchor = lc_history[:2]
-                    ghosts = [msg for msg in lc_history[2:-GHOST_HISTORY_WINDOW] if isinstance(msg, HumanMessage)]
-                    window = lc_history[-GHOST_HISTORY_WINDOW:]
-                    truncated_history = _truncate_ai_in_history(anchor + ghosts + window)
+                    # Fallback to ghost logic before the first summarization
+                    if len(lc_history) <= GHOST_HISTORY_MAX:
+                        truncated_history = _truncate_ai_in_history(lc_history)
+                    else:
+                        anchor = lc_history[:2]
+                        # Keep BOTH Human and AI messages in the ghost section,
+                        # but aggressively truncate AI responses so the model
+                        # still sees its own prior answers in condensed form.
+                        ghost_section = lc_history[2:-GHOST_HISTORY_WINDOW]
+                        ghosts = []
+                        for msg in ghost_section:
+                            if isinstance(msg, AIMessage):
+                                trimmed = msg.content[:GHOST_AI_CHARS]
+                                if len(msg.content) > GHOST_AI_CHARS:
+                                    trimmed += "\n... [truncated]"
+                                ghosts.append(AIMessage(content=trimmed))
+                            else:
+                                ghosts.append(msg)
+                        window = lc_history[-GHOST_HISTORY_WINDOW:]
+                        truncated_history = _truncate_ai_in_history(anchor + ghosts + window)
+
+                    # Hard token budget: drop oldest ghost messages until under budget
+                    def _est_tokens(msgs):
+                        return sum(len(m.content) for m in msgs) // 4
+                    while _est_tokens(truncated_history) > MAX_HISTORY_TOKENS and len(truncated_history) > 4:
+                        # Remove the 3rd message (first ghost after anchor pair)
+                        truncated_history.pop(2)
 
                 stream_iter = chain.stream({
                     "input": user_input,
@@ -844,15 +884,23 @@ if user_input:
                         st.session_state.sentinel_future = chunk["sentinel_future"]
 
                 # POST-STREAM USAGE FETCH
+                # Store generation_id so the fetch can run after write_stream
+                # returns, keeping it out of the hot streaming path entirely.
                 if generation_id and not st.session_state.token_usage.get("input") and not st.session_state.model_id.startswith(OLLAMA_PREFIX):
-                    fetched = _fetch_generation_usage(generation_id)
-                    if fetched:
-                        st.session_state.token_usage = fetched
+                    st.session_state["_pending_generation_id"] = generation_id
             
             # Execute streaming
             answer = st.write_stream(response_generator())
             result = full_response
-            
+
+            # Post-stream usage fetch — runs after response is fully rendered
+            # so the 1-second OpenRouter delay doesn't stall the displayed text.
+            pending_gen_id = st.session_state.pop("_pending_generation_id", None)
+            if pending_gen_id:
+                fetched = _fetch_generation_usage(pending_gen_id)
+                if fetched:
+                    st.session_state.token_usage = fetched
+
             # Phase 5: Commit metrics to history
             usage = st.session_state.token_usage
             st.session_state.metrics_history.append({

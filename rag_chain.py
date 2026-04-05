@@ -12,9 +12,6 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 
 import logging
-from langchain_classic.retrievers import ContextualCompressionRetriever
-from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
-from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 from langchain_community.chat_models import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI
@@ -29,32 +26,33 @@ from config import (
     OLLAMA_MODELS,
     LLM_TEMPERATURE,
     RETRIEVER_K,
-    RETRIEVER_FETCH_K,
     MAX_TOKENS,
-    RERANKER_MODEL_NAME,
-    RERANKER_TOP_N,
     ANTHROPIC_CACHE_BETA_HEADER,
     ENABLE_PROMPT_CACHING,
+    ENABLE_AUTO_SPECIALIST,
     MAX_CACHE_CHECKPOINTS,
-    MIN_PREV_QUERY_LENGTH,
-    MIN_CURRENT_QUERY_LENGTH,
     SEMANTIC_CACHE_THRESHOLD,
-    SENTINEL_INTERVAL,
     SENTINEL_MAX_TOKENS,
     SENTINEL_TOKEN_THRESHOLD,
+    SENTINEL_INTERVAL,
     TRUST_NATIVE_CACHE,
     PROVIDER_CACHE_PROFILES,
     ENABLE_HYBRID_SEARCH,
     BM25_WEIGHT,
     VECTOR_WEIGHT,
     USE_RERANKER,
+    RERANK_MODEL,
     RERANK_TOP_K,
+    RERANK_CANDIDATES,
+    PINNED_RELEVANCE_THRESHOLD,
+    STICKY_PINNED_CONTEXT,
+    SPECIALIST_MAPPING,
 )
 
 logger = logging.getLogger(__name__)
 
 # 🚀 Platinum Scaling: Context Window Limits
-MAX_CONTEXT_UNION = 15
+MAX_CONTEXT_UNION = 7
 
 from langchain_core.messages import (
     HumanMessage,
@@ -64,14 +62,18 @@ from langchain_core.messages import (
 
 from sentence_transformers import CrossEncoder
 import hashlib
-import statistics
 import pickle
 from rank_bm25 import BM25Okapi
 from nltk.tokenize import word_tokenize
 from backend import load_bm25_index
 
 # 🚀 Global Executor for non-blocking background tasks (Sentinel summaries)
+# Shut down any stale executor left over from a previous Streamlit hot-reload
+# before creating a fresh one.  Without this, each reload leaks 2 threads.
+import atexit as _atexit
+
 _background_executor = ThreadPoolExecutor(max_workers=2)
+_atexit.register(_background_executor.shutdown, wait=False)
 
 def _background_summarize(history: list[BaseMessage]):
     """Background task to update sentinel state without stalling the main stream."""
@@ -87,18 +89,25 @@ def _background_summarize(history: list[BaseMessage]):
 #  EXACT-MATCH QUERY CACHE
 # ═══════════════════════════════════════════════════════════════════════════
 # Zero-cost layer: if the user sends the *exact* same query string as the
-# previous turn, we can skip the embedding call entirely and reuse both
-# the cached embedding and the cached documents.  This handles the common
-# case of accidental double-submits and literal repeats with zero compute.
+# previous turn, we can skip the embedding call entirely.
+# We normalize the query (lowercase, strip punctuation) to catch "near-identical"
+# repeats like "Tell me more" vs "Tell me more.".
 
 _last_query_hash: str | None = None
 _last_query_embedding_cache: list[float] | None = None
 
 
+def _normalize_query(query: str) -> str:
+    """Normalize query for cache-hit robustness."""
+    import re
+    return re.sub(r'[^\w\s]', '', query).lower().strip()
+
+
 def _exact_match_cache_check(query: str) -> list[float] | None:
-    """Return the cached embedding if *query* is byte-identical to the last one."""
+    """Return the cached embedding if normalized *query* matches the last one."""
     global _last_query_hash
-    q_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()
+    norm_q = _normalize_query(query)
+    q_hash = hashlib.sha256(norm_q.encode("utf-8")).hexdigest()
     if q_hash == _last_query_hash and _last_query_embedding_cache is not None:
         return _last_query_embedding_cache
     return None
@@ -107,8 +116,26 @@ def _exact_match_cache_check(query: str) -> list[float] | None:
 def _exact_match_cache_store(query: str, embedding: list[float]):
     """Store the query hash and embedding for exact-match reuse."""
     global _last_query_hash, _last_query_embedding_cache
-    _last_query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()
+    norm_q = _normalize_query(query)
+    _last_query_hash = hashlib.sha256(norm_q.encode("utf-8")).hexdigest()
     _last_query_embedding_cache = embedding
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SENTINEL LOCKING
+# ═══════════════════════════════════════════════════════════════════════════
+_sentinel_in_progress = False
+
+def _background_summarize_locked(history: list[BaseMessage]):
+    """Wrapper to ensure only one sentinel task runs at a time."""
+    global _sentinel_in_progress
+    if _sentinel_in_progress:
+        return None
+    _sentinel_in_progress = True
+    try:
+        return _background_summarize(history)
+    finally:
+        _sentinel_in_progress = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -148,11 +175,20 @@ OLLAMA_PREFIX = "ollama:"
 # ═══════════════════════════════════════════════════════════════════════════
 
 def is_cache_capable(model: str | None) -> bool:
-    """Check if the model/provider supports prompt caching blocks."""
+    """
+    Check if the model/provider supports Anthropic-style prompt caching blocks.
+
+    Claude and Gemini 2.0 (via OpenRouter) both support the 
+    ``cache_control: {"type": "ephemeral"}`` block format.  
+    DeepSeek and Qwen use implicit prefix caching, so they don't 
+    need these markers but still benefit from our deterministic sort.
+    """
     if not model or model.startswith(OLLAMA_PREFIX):
         return False
+    
     m_lower = model.lower()
-    return any(p in m_lower for p in PROVIDER_CACHE_PROFILES)
+    # Claude (Anthropic) and Gemini (Google) both support explicit markers on OpenRouter
+    return "claude" in m_lower or "gemini" in m_lower
 
 
 def get_cache_profile(model: str | None) -> tuple[int, int]:
@@ -248,108 +284,10 @@ def get_llm(
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  RETRIEVER
-# ═══════════════════════════════════════════════════════════════════════════
-
-def get_retriever(db: Chroma, k: int | None = None, exclude_file: str | None = None):
-    """
-    Wrap a ChromaDB store as a LangChain retriever.
-    
-    If exclude_file is provided, we use a metadata filter to prevent 
-    retrieving from the 'Pinned' file to avoid duplicate context.
-    """
-    search_kwargs = {
-        "k": k or RETRIEVER_K,
-        "fetch_k": RETRIEVER_FETCH_K,
-    }
-    
-    if exclude_file:
-        search_kwargs["filter"] = {"source": {"$ne": exclude_file}}
-
-    return db.as_retriever(
-        search_type="mmr",
-        search_kwargs=search_kwargs,
-    )
 
 
 
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  CROSS-ENCODER RE-RANKER
-# ═══════════════════════════════════════════════════════════════════════════
-
-_cross_encoder: HuggingFaceCrossEncoder | None = None
-
-
-def _get_cross_encoder() -> HuggingFaceCrossEncoder:
-    """Return the singleton cross-encoder model (~80 MB, CPU)."""
-    global _cross_encoder
-    if _cross_encoder is None:
-        _cross_encoder = HuggingFaceCrossEncoder(model_name=RERANKER_MODEL_NAME)
-    return _cross_encoder
-
-
-class ScoringCrossEncoderReranker(CrossEncoderReranker):
-    """CrossEncoderReranker that preserves scores in document metadata."""
-
-    def compress_documents(self, documents, query, callbacks=None):
-        if not documents:
-            return []
-        scores = self.model.score([(query, doc.page_content) for doc in documents])
-        docs_with_scores = list(zip(documents, scores))
-        result = sorted(docs_with_scores, key=lambda x: x[1], reverse=True)
-        top_docs = []
-        for doc, score in result[: self.top_n]:
-            doc.metadata["reranker_score"] = round(float(score), 4)
-            top_docs.append(doc)
-        
-        # 🚀 Accuracy-First: DETERMINISTIC SORT (preserved by union logic)
-        return top_docs
-
-
-def get_reranking_retriever(
-    db: Chroma,
-    k: int | None = None,
-    exclude_file: str | None = None,
-    filter_extensions: list[str] | None = None,
-):
-    """
-    Wrap the MMR retriever with a cross-encoder re-ranker.
-    Optionally filter by file extensions (Phase 1b: Metadata Filtering).
-    """
-    search_kwargs = {
-        "k": k or RETRIEVER_K,
-        "fetch_k": RETRIEVER_FETCH_K,
-    }
-
-    # Build metadata filter
-    filters = {}
-    if exclude_file:
-        filters["source"] = {"$ne": exclude_file}
-    if filter_extensions:
-        filters["file_extension"] = {"$in": filter_extensions}
-
-    if filters:
-        if len(filters) == 1:
-            search_kwargs["filter"] = filters
-        else:
-            # ChromaDB $and for multiple filters
-            search_kwargs["filter"] = {"$and": [{k: v} for k, v in filters.items()]}
-
-    base_retriever = db.as_retriever(
-        search_type="mmr",
-        search_kwargs=search_kwargs,
-    )
-    compressor = ScoringCrossEncoderReranker(
-        model=_get_cross_encoder(),
-        top_n=RERANKER_TOP_N,
-    )
-    return ContextualCompressionRetriever(
-        base_compressor=compressor,
-        base_retriever=base_retriever,
-    )
 
 
 def hybrid_search(
@@ -368,24 +306,39 @@ def hybrid_search(
     via ``similarity_search_by_vector``, avoiding a redundant embedding
     inference that ChromaDB would otherwise perform internally.
     """
-    from config import ENABLE_HYBRID_SEARCH, BM25_WEIGHT, VECTOR_WEIGHT
-
     if not ENABLE_HYBRID_SEARCH:
-        # Fallback to standard vector search
-        search_kwargs = {"k": k, "fetch_k": k*5}
+        # Fallback to standard vector search.
+        # fetch_k is an MMR-only parameter and is not supported by
+        # similarity_search / similarity_search_by_vector — omit it.
+        chroma_filter = None
         if exclude_file:
-            search_kwargs["filter"] = {"source": {"$ne": exclude_file}}
+            chroma_filter = {"source": {"$ne": exclude_file}}
         if query_embedding:
-            return db.similarity_search_by_vector(query_embedding, **search_kwargs)
-        return db.similarity_search(query, **search_kwargs)
+            return db.similarity_search_by_vector(query_embedding, k=k, filter=chroma_filter)
+        return db.similarity_search(query, k=k, filter=chroma_filter)
+
+    # Build a ChromaDB metadata filter from the caller's exclusion criteria so
+    # the vector store never fetches docs that will be thrown away post-fetch.
+    # BM25 has no filter API — _rank_docs() still handles that side.
+    _conditions: list[dict] = []
+    if exclude_file:
+        _conditions.append({"source": {"$ne": exclude_file}})
+    if filter_extensions:
+        _conditions.append({"file_extension": {"$in": filter_extensions}})
+    if len(_conditions) == 0:
+        _chroma_filter = None
+    elif len(_conditions) == 1:
+        _chroma_filter = _conditions[0]
+    else:
+        _chroma_filter = {"$and": _conditions}
 
     # 1. 🔍 Vector Search (Semantic)
     # We fetch a larger candidate pool for RRF to merge.
     # Reuse pre-computed embedding when available to avoid double-embedding.
     if query_embedding:
-        vector_docs = db.similarity_search_by_vector(query_embedding, k=k*3)
+        vector_docs = db.similarity_search_by_vector(query_embedding, k=k*3, filter=_chroma_filter)
     else:
-        vector_docs = db.similarity_search(query, k=k*3)
+        vector_docs = db.similarity_search(query, k=k*3, filter=_chroma_filter)
     
     # 2. 🔍 BM25 Keyword Search
     bm25_data = load_bm25_index(collection_name)
@@ -395,8 +348,19 @@ def hybrid_search(
         all_docs = bm25_data["docs"]
         
         tokenized_query = word_tokenize(query.lower())
-        top_n = bm25_model.get_top_n(tokenized_query, all_docs, n=k*3)
-        bm25_docs = top_n
+        # 🚀 Fix: Calculate all scores first, apply exact metadata filters, then sort.
+        # This prevents the bug where the top-k results are all excluded files, resulting in 0 docs.
+        scores = bm25_model.get_scores(tokenized_query)
+        doc_scores = []
+        for score, doc in zip(scores, all_docs):
+            if exclude_file and doc.metadata.get("source") == exclude_file:
+                continue
+            if filter_extensions and doc.metadata.get("file_extension") not in filter_extensions:
+                continue
+            doc_scores.append((score, doc))
+            
+        doc_scores.sort(key=lambda x: x[0], reverse=True)
+        bm25_docs = [doc for score, doc in doc_scores[:k*3]]
 
     # 3. 🧪 Reciprocal Rank Fusion (RRF)
     # RRF Score(d) = sum(1 / (k + rank))
@@ -424,23 +388,9 @@ def hybrid_search(
     sorted_ids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
     rrf_results = [doc_map[did] for did in sorted_ids[:k]]
 
-    # 🚀 Cross-Encoder Re-ranking on RRF output
-    # Apply cross-encoder scoring to the RRF-merged candidates.
-    # This reorders by true query–document relevance and stores scores
-    # in metadata for debug visibility.
-    if rrf_results:
-        try:
-            ce = _get_cross_encoder()
-            pairs = [(query, doc.page_content) for doc in rrf_results]
-            ce_scores = ce.score(pairs)
-            for doc, score in zip(rrf_results, ce_scores):
-                doc.metadata["reranker_score"] = round(float(score), 4)
-            # Sort descending by cross-encoder score, keep top RERANKER_TOP_N
-            rrf_results.sort(key=lambda d: d.metadata.get("reranker_score", 0), reverse=True)
-            rrf_results = rrf_results[:RERANKER_TOP_N]
-        except Exception:
-            # Graceful fallback: if cross-encoder fails, return RRF order
-            pass
+    # Cross-encoder re-ranking is handled by LocalReRanker.rerank() in the
+    # caller — applying it here as well would score the same docs twice with
+    # the same model for zero quality gain.
 
     return rrf_results
 
@@ -454,13 +404,16 @@ CORE_INSTRUCTIONS = """\
 You are an expert AI assistant specialising in code analysis and document comprehension.
 
 INSTRUCTIONS:
-1. Answer the user's question using ONLY the retrieved context below.
+1. Answer the user's question using ONLY the retrieved context, pinned source, and conversation state provided below.
 2. If the context does not contain enough information, say so clearly — \
    do NOT fabricate an answer.
 3. When discussing code, reference the source file and explain the logic.
 4. Be concise, precise, and use markdown formatting where helpful.
 5. If the user asks for code improvements, provide the improved version \
    with clear explanations.
+6. The 'CONVERSATION STATE' section contains a summary of our past discussion. \
+   You MUST use it to understand follow-up questions and you MUST report its contents if the user asks what it says.
+7. CRITICAL OVERRIDE: If the user asks you to retrieve or read the 'CONVERSATION STATE', do NOT explain the python codebase or how variables like {sentinel_state} work. Look physically below at the text under the heading 'CONVERSATION STATE:' and copy it exactly word-for-word. Even if there are no bullet points and it says "No summary generated yet.", you must reply with exactly that text.
 """
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -469,39 +422,34 @@ INSTRUCTIONS:
 
 def _prepare_history_with_cache(history: list[BaseMessage], model: str | None) -> list[BaseMessage]:
     """
-    Prepare chat history for the prompt.
-
-    Previously this placed a cache_control breakpoint on history[0],
-    but that message changes every turn — creating a cache *write*
-    (cost penalty) on every invocation rather than a cache *read*
-    (cost saving).  The 4 system-block breakpoints already cover the
-    stable prefix; adding a 5th on volatile history is counterproductive.
-    We now pass history through as plain messages.
+    Prepare chat history with optional caching.
+    
+    For models with >4 breakpoints (Gemini), we add a cache marker to 
+    the last message in history to checkpoint the conversation.
+    For Claude (4 breakpoints), system blocks already consume the limit.
     """
     if not history:
         return history
-
-    if not ENABLE_PROMPT_CACHING or not is_cache_capable(model):
-        return list(history)
-
-    # 🚀 Professional Polish: Tail-End Caching
-    # We place a cache_control marker on the last message in history.
-    # This allows the provider to cache the growing conversation body
-    # after the stable system-prompt prefix.
-    processed = list(history)
-    last_msg = processed[-1]
-    if hasattr(last_msg, "content"):
-        # Wrap the content in a cacheable block for supported models (Claude)
-        content = last_msg.content
-        if isinstance(content, str):
+    
+    max_bp, _ = get_cache_profile(model)
+    # If we have spare breakpoints (Gemini supports 8+), use one for history.
+    # We use 4 for system blocks, so 5+ is the threshold.
+    if max_bp > 4 and is_cache_capable(model) and ENABLE_PROMPT_CACHING:
+        new_history = list(history)
+        last_msg = new_history[-1]
+        # Attach cache control to the last message content
+        if isinstance(last_msg.content, str):
             last_msg.content = [
                 {
                     "type": "text",
-                    "text": content,
+                    "text": last_msg.content,
                     "cache_control": {"type": "ephemeral"}
                 }
             ]
-    return processed
+        return new_history
+        
+    return list(history)
+
 
 # 🚀 Professional Polish: Linguistic Logic Gates (History vs Speed)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -525,7 +473,6 @@ class LocalReRanker:
         self._init_model()
 
     def _init_model(self):
-        from config import USE_RERANKER, RERANK_MODEL
         if USE_RERANKER:
             try:
                 # This may take a minute to download on first run (~100MB)
@@ -613,12 +560,35 @@ class VectorRouter:
         # Default
         return "GENERAL"
 
+    @staticmethod
+    def _extractive_fallback(history: list[BaseMessage]) -> str:
+        """
+        Pure-Python extractive summary used when the local LLM (Ollama)
+        is unavailable.  Keeps the first sentence of each recent human
+        message to preserve topic continuity without any external calls.
+        """
+        bullets = []
+        for m in history[-8:]:
+            if not isinstance(m, HumanMessage):
+                continue
+            text = m.content.strip()
+            # Take the first sentence (up to first period, question mark, or 120 chars)
+            end = len(text)
+            for ch in ".?!":
+                idx = text.find(ch)
+                if 0 < idx < end:
+                    end = idx + 1
+            snippet = text[:min(end, 120)].strip()
+            if snippet:
+                bullets.append(f"- {snippet}")
+        return "\n".join(bullets[-3:]) if bullets else "No summary available."
+
     def summarize_state_fast(self, history: list[BaseMessage]) -> str:
         """
-        If needed, the LLM can still summarize, but we avoid doing this
-        on every turn. Logic is maintained but decoupled from pre-flight.
+        Summarize conversation state.  Tries the local Ollama model first;
+        falls back to a pure-Python extractive summary if Ollama is down
+        so history compression is never silently skipped.
         """
-        # (This remains as an LLM call but is only triggered on intervals)
         try:
             llm = get_llm(model=f"{OLLAMA_PREFIX}{AGENT_ROUTER_MODEL}", temperature=0.0, streaming=False)
             context = "\n".join([f"{'User' if isinstance(m, HumanMessage) else 'AI'}: {m.content[:500]}" for m in history[-6:]])
@@ -630,7 +600,8 @@ class VectorRouter:
             response = llm.invoke(prompt)
             return response.content.strip()
         except Exception:
-            return "Error generating summary."
+            logger.warning("Ollama unavailable for sentinel — using extractive fallback")
+            return self._extractive_fallback(history)
 
 
 def _sort_docs_deterministically(
@@ -677,6 +648,19 @@ def calculate_cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
         return 0.0
     return float(np.dot(v1, v2) / (norm1 * norm2))
 
+def _content_len(c) -> int:
+    """Return the character length of a message content field.
+
+    Content may be a plain string or a list of Anthropic cache-control
+    dicts — handles both so token estimates stay accurate.
+    """
+    if isinstance(c, str):
+        return len(c)
+    if isinstance(c, list):
+        return sum(len(b.get("text", "")) for b in c if isinstance(b, dict))
+    return 0
+
+
 def build_rag_chain(db: Chroma, model: str | None = None):
     """
     Build a retrieval chain with stable Full-Context Caching (Architecture A).
@@ -687,29 +671,26 @@ def build_rag_chain(db: Chroma, model: str | None = None):
     # We build our retrievers inside the lambda to support the 
     # Pinned File exclusion filter.
 
-    # 🚀 Professional Polish: Dual-Path Prompt Construction
-    # Non-cache models (Gemini/Qwen/Ollama) get a clean string.
-    # Cache-capable models (Claude) get the structured block list.
+    # Dual-Path Prompt Construction
+    # Only Claude supports Anthropic-style cache_control blocks via OpenRouter.
+    # All other models (Gemini/Qwen/DeepSeek/Ollama) get a clean string prompt.
     
     is_cc = is_cache_capable(model) and ENABLE_PROMPT_CACHING
     
     max_bp, _ = get_cache_profile(model)
 
     if is_cc:
-        # 🚀 Dynamic Cache Blocks — driven by provider profile
+        # Dynamic Cache Blocks — Claude only
         # Ordered from most stable to most volatile.  We only attach
         # cache_control markers to the first ``max_bp`` blocks; the
         # rest are plain text (no wasted cache writes).
-        #
-        # Claude (max_bp=4):  all 4 blocks cached
-        # Gemini (max_bp=8):  all 4 cached (headroom for future splits)
-        # Model w/ 2 bp:      only Instructions + Pinned get markers
+        # Stable order: Instructions > Pinned > Sentinel > RAG context.
         block_specs = [
             # (label/template, most stable first)
             CORE_INSTRUCTIONS,
             "FULL SOURCE CONTEXT (PINNED):\n{full_source_context}",
-            "STABLE RAG CONTEXT (DETERMINISTIC):\n{stable_context}",
             "CONVERSATION STATE:\n{sentinel_state}",
+            "STABLE RAG CONTEXT (DETERMINISTIC):\n{stable_context}",
         ]
         system_blocks = []
         for idx, text in enumerate(block_specs):
@@ -733,8 +714,8 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         system_text = (
             f"{CORE_INSTRUCTIONS}\n\n"
             "FULL SOURCE CONTEXT (PINNED):\n{full_source_context}\n\n"
-            "STABLE RAG CONTEXT (DETERMINISTIC):\n{stable_context}\n\n"
-            "CONVERSATION STATE:\n{sentinel_state}"
+            "CONVERSATION STATE:\n{sentinel_state}\n\n"
+            "STABLE RAG CONTEXT (DETERMINISTIC):\n{stable_context}"
         )
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_text),
@@ -750,6 +731,11 @@ def build_rag_chain(db: Chroma, model: str | None = None):
     reranker = LocalReRanker() if USE_RERANKER else None
 
     question_answer_chain = prompt | llm
+    _specialist_llm_cache: dict[str, object] = {}
+    # Cooldown tracker: prevents sentinel from re-firing every turn once the
+    # token threshold is crossed.  Stored as a mutable dict so the closure
+    # can mutate it without a `nonlocal` declaration.
+    _sentinel_cooldown: dict[str, int] = {"last_turn": 0}
 
     def _full_context_cache_chain(inputs: dict):
         """
@@ -765,18 +751,19 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         last_query_emb = inputs.get("last_query_embedding")
         force_retrieval = inputs.get("force_retrieval", False)
 
-        # 1. 🤖 Context Awareness (Latency-Free) ──────────────────────────────
-        existing_sentinel = inputs.get("sentinel_state", "")
+        # 1. Context Awareness (Latency-Free)
         turn_count = sum(1 for m in history if isinstance(m, HumanMessage))
 
-        # Token-aware sentinel trigger: summarize when history is large enough
+        # Token-aware sentinel trigger: summarize when history is large enough.
         # Rough estimate: 1 token ≈ 4 characters.
-        estimated_history_tokens = sum(len(m.content) for m in history) // 4
-        from config import SENTINEL_TOKEN_THRESHOLD, SENTINEL_INTERVAL
+        estimated_history_tokens = sum(_content_len(m.content) for m in history) // 4
+        # Fire when history exceeds the token budget AND at least SENTINEL_INTERVAL
+        # turns have passed since the last sentinel run.  Without the cooldown,
+        # once the threshold is crossed it fires every single turn.
         should_summarize = (
             turn_count > 0
             and estimated_history_tokens >= SENTINEL_TOKEN_THRESHOLD
-            and turn_count % SENTINEL_INTERVAL == 0
+            and (turn_count - _sentinel_cooldown["last_turn"]) >= SENTINEL_INTERVAL
         )
 
         # Calculate semantic similarity to last query.
@@ -793,17 +780,18 @@ def build_rag_chain(db: Chroma, model: str | None = None):
                 _exact_match_cache_store(user_input, current_emb)
             current_similarity = calculate_cosine_similarity(current_emb, last_query_emb)
 
-        # 🚀 Semantic Intent Detection (Latency-Free)
-        from config import SEMANTIC_CACHE_THRESHOLD, CONTEXT_DECAY_THRESHOLD
-        
-        # We always retrieve (TRUST_NATIVE_CACHE=True), but we still use 
-        # similarity to categorize the intent for UI telemetry.
+        # Semantic Intent Detection (Latency-Free)
+
+        # Semantic hit drives two behaviours:
+        # 1. For Claude (cache-capable): retrieval still happens so the
+        #    provider cache can fire on the deterministic prefix.
+        # 2. For all other models: retrieval is skipped on a semantic hit
+        #    since there's no provider-side cache benefit from re-fetching.
         is_semantic_hit = (
             current_similarity >= SEMANTIC_CACHE_THRESHOLD
         )
         
         # 3. Pinned context passthrough with Relevance Gate
-        from config import PINNED_RELEVANCE_THRESHOLD, STICKY_PINNED_CONTEXT
         pinned_eligible = False
         if pinned_content and pinned_content != "None pinned.":
             if STICKY_PINNED_CONTEXT:
@@ -832,23 +820,36 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         intent = router.classify_intent(current_similarity) if history else "NEW"
         
         # Phase 4: Specialist Detection
-        enable_auto = inputs.get("auto_specialist", config.ENABLE_AUTO_SPECIALIST)
-        from config import SPECIALIST_MAPPING
+        enable_auto = inputs.get("auto_specialist", ENABLE_AUTO_SPECIALIST)
         specialty = router.detect_specialty(user_input) if enable_auto else "GENERAL"
         specialist_model = SPECIALIST_MAPPING.get(specialty) if enable_auto else None
 
-        # 🚀 ARCHITECTURAL PURITY: Always retrieve.
-        # Deterministic sorting (Layer 7) handles the provider-side cost savings.
         pinned_file = inputs.get("exclude_file")
         ext_filter = inputs.get("filter_extensions")
 
-        # 2. Hybrid search (ChromaDB + BM25)
-        # We fetch a larger candidate pool if re-ranking is enabled.
-        from config import RERANK_CANDIDATES, RERANK_TOP_K, RETRIEVER_K
+        # Hybrid search (ChromaDB + BM25)
+        # When the model supports provider-side prefix caching (Claude/Gemini/DeepSeek),
+        # always retrieve so the deterministic sort can maximise cache hits.
+        # For all other models the provider cache doesn't help, so skip
+        # retrieval on semantic cache hits to save compute.
         k_fetch = RERANK_CANDIDATES if USE_RERANKER else RETRIEVER_K
 
+        # 🚀 Fix: Include DeepSeek/Qwen as cache-capable for prefix stability, 
+        # even if they don't use explicit Anthropic-style markers.
+        provider_has_cache = is_cache_capable(model) or any(
+            p in (model or "").lower() for p in ["deepseek", "qwen", "mistral"]
+        )
+        
+        skip_retrieval = (
+            not (TRUST_NATIVE_CACHE and provider_has_cache)
+            and is_semantic_hit
+            and bool(previous_union)
+            and not force_retrieval
+        )
+
+        reranker_score = 0.0
         new_retrievals = []
-        if db:
+        if not skip_retrieval and db:
             new_retrievals = hybrid_search(
                 db, user_input,
                 collection_name=coll_name,
@@ -857,48 +858,51 @@ def build_rag_chain(db: Chroma, model: str | None = None):
                 filter_extensions=ext_filter,
                 query_embedding=current_emb,
             )
-        
+        elif skip_retrieval:
+            # Semantic cache hit — reuse previous docs as the fresh set.
+            new_retrievals = list(previous_union)
+
         # 3. 🎯 Local Re-ranking (Phase 3) ──────────────────────────────
-        if USE_RERANKER and reranker and new_retrievals:
+        if USE_RERANKER and reranker and new_retrievals and not skip_retrieval:
             new_retrievals = reranker.rerank(
-                user_input, 
-                new_retrievals, 
+                user_input,
+                new_retrievals,
                 top_k=RERANK_TOP_K
             )
-            # 🚀 Phase 5: Capture the top relevance score for telemetry
+            # Capture the top relevance score for telemetry
             reranker_score = getattr(reranker, 'last_top_score', 0.0)
 
-        # 🤖 Intent-Aware Union Logic with Context Decay
+        # Intent-Aware Union Logic with Context Decay
         if intent == "FOLLOW-UP":
-            # 🧪 CONTEXT DECAY: Score previous chunks against current query.
-            # If an old chunk is no longer relevant, evict it to keep prompt lean.
-            decayed_union = []
-            if previous_union and current_emb:
-                from backend import get_embedding_model
-                # This is fast as chunks are small
-                for doc in previous_union:
-                    # We use a simple heuristic to avoid re-embedding.
-                    # If the doc was retrieved recently, it likely has high score.
-                    # We only decay if the semantic context shift is significant.
-                    doc_sim = calculate_cosine_similarity(current_emb, get_embedding_model().embed_query(doc.page_content[:200]))
-                    if doc_sim >= CONTEXT_DECAY_THRESHOLD:
-                        decayed_union.append(doc)
-            
-            combined = decayed_union + new_retrievals
+            # 🚀 Fix: Prevent "Knowledge Lock-in" by ensuring fresh retrievals 
+            # always have priority. We calculate unique new docs first.
             seen_hashes = set()
-            unique_docs = []
-            for d in combined:
+            unique_new = []
+            for d in new_retrievals:
                 h = d.metadata.get("content_hash", d.page_content)
                 if h not in seen_hashes:
-                    unique_docs.append(d)
+                    unique_new.append(d)
                     seen_hashes.add(h)
-            final_docs = (
-                unique_docs
-                if len(unique_docs) <= MAX_CONTEXT_UNION
-                else unique_docs[-MAX_CONTEXT_UNION:]
-            )
+
+            # Cap the new retrievals at MAX_CONTEXT_UNION
+            unique_new = unique_new[:MAX_CONTEXT_UNION]
+            
+            # Calculate how many slots are left for the older stable docs
+            available_old_slots = MAX_CONTEXT_UNION - len(unique_new)
+            
+            # Keep older docs up to the available slots. We iterate in order, so we keep 
+            # the beginning of the old sequence intact, preserving the longest possible 
+            # byte prefix for the provider's prompt cache.
+            surviving_old = []
+            for d in previous_union:
+                h = d.metadata.get("content_hash", d.page_content)
+                if h not in seen_hashes and len(surviving_old) < available_old_slots:
+                    surviving_old.append(d)
+                    seen_hashes.add(h)
+                    
+            final_docs = surviving_old + unique_new
         else:
-            final_docs = new_retrievals
+            final_docs = new_retrievals[:MAX_CONTEXT_UNION]
 
         # 🚀 Prefix-Preserving Sort: stable docs stay at top, new docs append.
         # This keeps the stable_context byte prefix identical across turns
@@ -916,16 +920,19 @@ def build_rag_chain(db: Chroma, model: str | None = None):
         inputs["context"] = sorted_docs
         inputs["chat_history"] = _prepare_history_with_cache(history, model)
         
-        # Phase 4: Dynamic Specialist Swap
-        active_llm = question_answer_chain.bound if hasattr(question_answer_chain, "bound") else question_answer_chain
+        # Dynamic Specialist Swap — cached LLM instances
+        active_chain = question_answer_chain
         if enable_auto and specialist_model:
-            # We only swap if the specialist is different from the current model
-            # to avoid redundant initialization.
-            current_m = getattr(active_llm, "model_name", "")
+            current_m = getattr(
+                active_chain.bound if hasattr(active_chain, "bound") else active_chain,
+                "model_name", "",
+            )
             if specialist_model != current_m:
-                active_llm = get_llm(model=specialist_model, streaming=True)
-                # Re-bind the chain with the new specialist
-                question_answer_chain = prompt | active_llm
+                if specialist_model not in _specialist_llm_cache:
+                    _specialist_llm_cache[specialist_model] = get_llm(
+                        model=specialist_model, streaming=True
+                    )
+                active_chain = prompt | _specialist_llm_cache[specialist_model]
         
         # Ensure we always have an embedding to pass back for next turn.
         # On the first turn (no last_query_emb), compute it now so the
@@ -939,22 +946,23 @@ def build_rag_chain(db: Chroma, model: str | None = None):
                 _exact_match_cache_store(user_input, current_emb)
 
         # 🚀 ASYNC SENTINEL TRIGGER
-        # We trigger the summary in the background. It will be available 
+        # We trigger the summary in the background. It will be available
         # for the NEXT turn to keep the current turn latency-free.
         background_future = None
-        if should_summarize:
-            background_future = _background_executor.submit(_background_summarize, history)
+        if should_summarize and not _sentinel_in_progress:
+            _sentinel_cooldown["last_turn"] = turn_count
+            background_future = _background_executor.submit(_background_summarize_locked, history)
 
         yield {
             "context": inputs["context"], 
             "intent": intent, 
             "query_embedding": current_emb,
             "specialist_active": specialist_model if enable_auto else None,
-            "top_relevance_score": reranker_score if 'reranker_score' in locals() else 0.0,
+            "top_relevance_score": reranker_score,
             "sentinel_future": background_future # Pass future to UI for persistence
         }
         
-        for chunk in question_answer_chain.stream(inputs):
+        for chunk in active_chain.stream(inputs):
             content = chunk.content if hasattr(chunk, "content") else str(chunk)
             yield {"answer": content, "raw_chunk": chunk}
 

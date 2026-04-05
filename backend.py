@@ -319,16 +319,19 @@ def ingest_into_chroma(
     if not documents:
         raise ValueError("No documents to ingest — check your file/folder path.")
 
-    # Stamp each document with a content hash
+    # Stamp content_hash only on documents that don't already have one.
+    # load_and_chunk_codebase and load_and_chunk_pdf set this during chunking,
+    # so recomputing it here is redundant for the normal ingestion path.
     for doc in documents:
-        doc.metadata["content_hash"] = _content_hash(doc)
+        if "content_hash" not in doc.metadata:
+            doc.metadata["content_hash"] = _content_hash(doc)
 
     embedding = get_embedding_model()
 
     # Try loading existing collection to deduplicate
     existing_db = load_existing_chroma(collection_name)
     if existing_db is not None:
-        existing_data = existing_db.get()
+        existing_data = existing_db.get(include=["metadatas"])
         existing_hashes = {
             meta["content_hash"]
             for meta in existing_data.get("metadatas", [])
@@ -338,6 +341,9 @@ def ingest_into_chroma(
         if not new_docs:
             return existing_db, 0
         existing_db.add_documents(new_docs)
+        # Keep BM25 in sync with ChromaDB — must update here too,
+        # not just on the fresh-collection path below.
+        _update_bm25_index(new_docs, collection_name)
         return existing_db, len(new_docs)
 
     db = Chroma.from_documents(
@@ -449,13 +455,10 @@ def load_existing_chroma(collection_name: str = "default") -> Chroma | None:
         embedding_function=embedding,
         collection_name=collection_name,
     )
-    # Quick sanity check — empty collection means nothing was ingested
+    # Use the collection's native count — avoids loading any documents
+    # just to verify the collection is non-empty.
     try:
-        data = db.get(limit=1)
-        count = len(data["ids"])
-        if count == 0:
-            # Double-check with full count via get()
-            count = len(db.get()["ids"])
+        count = db._collection.count()
     except Exception:
         count = 0
     if count == 0:
@@ -492,16 +495,25 @@ def get_collection_info(collection_name: str) -> dict:
 
 
 def delete_collection(collection_name: str) -> bool:
-    """Delete a ChromaDB collection. Returns True if deleted."""
+    """Delete a ChromaDB collection and its associated BM25 index. Returns True if deleted."""
     if not os.path.isdir(CHROMA_DB_DIR):
         return False
     import chromadb
     client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
     try:
         client.delete_collection(collection_name)
-        return True
     except Exception:
         return False
+    # Remove BM25 pickle so stale data isn't merged into a future
+    # collection created with the same name.
+    bm25_path = _get_bm25_path(collection_name)
+    if os.path.exists(bm25_path):
+        try:
+            os.remove(bm25_path)
+        except Exception as e:
+            logger.warning("Could not delete BM25 index for '%s': %s", collection_name, e)
+    _bm25_cache.pop(collection_name, None)
+    return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -538,13 +550,10 @@ class AsyncIngestionTask:
             self.progress = 0.1
             
             if self.is_pdf:
-                # PDF ingestion is usually fast, so we do it in one go
-                from langchain_community.document_loaders import PyPDFLoader
-                loader = PyPDFLoader(self.target_path)
-                raw_docs = loader.load()
-                from config import PDF_CHUNK_SIZE
-                splitter = _get_splitter(chunk_size_override=PDF_CHUNK_SIZE)
-                chunks = splitter.split_documents(raw_docs)
+                # Route through load_and_chunk_pdf so zero-chunking,
+                # content_hash, and chunk_index metadata are all set
+                # consistently — same as the sync ingestion path.
+                chunks = load_and_chunk_pdf(self.target_path)
             else:
                 # Codebase ingestion with file-by-file progress
                 def _update_progress(curr, tot, name):

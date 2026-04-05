@@ -61,9 +61,9 @@ MAX_TOKENS: int = 4096                 # enough room for code generation
 EMBEDDING_MODEL_NAME: str = "BAAI/bge-small-en-v1.5"     # ~130 MB download
 
 # ── Chunking parameters ────────────────────────────────────────────────────
-CHUNK_SIZE: int = 1000          # characters per chunk (default fallback)
+CHUNK_SIZE: int = 1500          # characters per chunk (default fallback)
 CHUNK_OVERLAP: int = 200        # overlap between chunks
-CODE_CHUNK_SIZE: int = 500      # smaller chunks for dense code
+CODE_CHUNK_SIZE: int = 1000     # smaller chunks for dense code
 PDF_CHUNK_SIZE: int = 1500      # larger chunks for prose documents
 
 # ── Document-Level Caching (Zero Chunking) ─────────────────────────────────
@@ -91,9 +91,8 @@ MIN_CURRENT_QUERY_LENGTH: int = 10  # below this, always augment with previous q
 
 # ── Semantic cache ─────────────────────────────────────────────────────────
 SEMANTIC_CACHE_THRESHOLD: float = 0.85    # cosine similarity to reuse cached docs
-CONTEXT_DECAY_THRESHOLD: float = 0.35     # similarity below which old chunks are evicted
 PINNED_RELEVANCE_THRESHOLD: float = 0.40  # min similarity to inject pinned file
-STICKY_PINNED_CONTEXT: bool = True        # preserve cache prefix stability regardless of relevance
+STICKY_PINNED_CONTEXT: bool = False       # when False, PINNED_RELEVANCE_THRESHOLD gates injection
 
 # ── Trust Native Cache ────────────────────────────────────────────────────
 # When True, the system ALWAYS retrieves fresh chunks (never skips retrieval
@@ -106,6 +105,8 @@ TRUST_NATIVE_CACHE: bool = True
 GHOST_HISTORY_WINDOW: int = 8             # recent messages to keep in full
 GHOST_HISTORY_MAX: int = 10               # beyond this, truncate with ghost logic
 AI_RESPONSE_MAX_CHARS: int = 500          # max chars per AI message in ghost history
+GHOST_AI_CHARS: int = 200                 # max chars per AI message in the ghost (middle) section
+MAX_HISTORY_TOKENS: int = 2000            # hard token budget for chat history sent to LLM
 
 # ── Sentinel History Cache ─────────────────────────────────────────────────
 SENTINEL_INTERVAL: int = 5                # summarize every N conversation turns
@@ -114,12 +115,16 @@ SENTINEL_TOKEN_THRESHOLD: int = 3000      # estimated history tokens before forc
 
 # ── Cross-Provider Cache Config ────────────────────────────────────────────
 # Provider-specific cache checkpoint limits and minimum token thresholds.
+# Keys are provider/family prefixes (not version strings) so all current
+# and future model versions match without config changes.
+# Checked in order — put more specific patterns first if needed.
 # {provider_pattern: (max_checkpoints, min_tokens_for_cache_write)}
 PROVIDER_CACHE_PROFILES: dict[str, tuple[int, int]] = {
-    "claude-3":    (4, 1024),    # Anthropic: 4 breakpoints, 1024 min
-    "gemini-2.0":  (8, 1028),    # Gemini: more checkpoints, 1028 min
-    "deepseek":    (4, 1024),    # DeepSeek: similar to Claude
-    "qwen-3":      (4, 1024),    # Qwen: similar to Claude
+    "claude":    (4, 1024),    # Anthropic: all Claude versions (3, 4, …)
+    "gemini":    (8, 1028),    # Google: all Gemini versions (1.5, 2.0, 2.5, …)
+    "deepseek":  (4, 1024),    # DeepSeek: all versions
+    "qwen":      (4, 1024),    # Qwen: all versions (2.5, 3, coder, …)
+    "mistral":   (4, 1024),    # Mistral: all versions
 }
 
 # 🚀 Phase 3: Relevance Optimization (Re-ranking)
