@@ -140,6 +140,8 @@ if "specialist_counts" not in st.session_state:
     st.session_state.specialist_counts = {"CODE": 0, "REASONING": 0, "VISION": 0, "GENERAL": 0}
 if "last_query_embedding" not in st.session_state:
     st.session_state.last_query_embedding = None
+if "last_query" not in st.session_state:
+    st.session_state.last_query = None
 if "debug_mode" not in st.session_state:
     st.session_state.debug_mode = False
 if "ingestion_task" not in st.session_state:
@@ -218,61 +220,33 @@ def extract_usage_metadata(raw_chunk) -> dict:
     return {k: (v if v is not None else 0) for k, v in usage.items()}
 
 
-def _fetch_generation_usage(generation_id: str) -> dict:
+def _bg_fetch_generation_usage(generation_id: str):
     """
     Fetch token usage from OpenRouter's generation endpoint.
-    Waits 1 second for OpenRouter to finalise the record, then fetches.
-    This runs in a background thread so the UI is never blocked.
+    Runs in a detached background thread to prevent UI freezing.
     """
     import time
     import requests
     from config import OPENROUTER_API_KEY
 
     if not OPENROUTER_API_KEY:
-        return {}
+        return
 
-    time.sleep(1)  # OpenRouter needs a moment to finalize the record
+    time.sleep(1.5)  # OpenRouter needs a moment to finalize the record
     url = f"https://openrouter.ai/api/v1/generation?id={generation_id}"
     try:
         resp = requests.get(url, headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"}, timeout=5)
-        if resp.status_code != 200:
-            return {}
-        data = resp.json().get("data", {})
-        usage = {
-            "input": data.get("tokens_prompt", 0),
-            "output": data.get("tokens_completion", 0),
-            "total": (data.get("tokens_prompt", 0) + data.get("tokens_completion", 0)),
-        }
-        cached = data.get("tokens_cached", 0)
-        if cached:
-            usage["cache_read"] = cached
-        return usage
+        if resp.status_code == 200:
+            data = resp.json().get("data", {})
+            st.session_state.token_usage = {
+                "input": data.get("tokens_prompt", 0),
+                "output": data.get("tokens_completion", 0),
+                "total": (data.get("tokens_prompt", 0) + data.get("tokens_completion", 0)),
+                "cache_read": data.get("tokens_cached", 0)
+            }
+            # Usage injected to session safely. Will naturally update on next interaction.
     except Exception:
-        return {}
-
-
-def _truncate_ai_in_history(history: list) -> list:
-    """
-    Cap AI response length in chat history to reduce token waste,
-    while aggressively preserving code blocks so the LLM remembers
-    the actual code it wrote.
-    """
-    import re
-    truncated = []
-    for msg in history:
-        if isinstance(msg, AIMessage) and len(msg.content) > AI_RESPONSE_MAX_CHARS:
-            code_blocks = re.findall(r"(```.*?```)", msg.content, flags=re.DOTALL)
-            if code_blocks:
-                gist = msg.content[:400]
-                trimmed = f"{gist}\n... [prose truncated]\n\n" + "\n\n".join(code_blocks)
-                if len(trimmed) > AI_RESPONSE_MAX_CHARS * 3:
-                    trimmed = trimmed[:AI_RESPONSE_MAX_CHARS * 3] + "\n```\n... [code truncated]"
-            else:
-                trimmed = msg.content[:AI_RESPONSE_MAX_CHARS] + "\n... [truncated for context efficiency]"
-            truncated.append(AIMessage(content=trimmed))
-        else:
-            truncated.append(msg)
-    return truncated
+        pass
 
 
 def detect_force_retrieval(query: str, collection_name: str | None) -> bool:
@@ -377,6 +351,7 @@ with st.sidebar:
         st.session_state.rag_chain = None
         # 🚀 Invalidation: Model change clears context and tracking
         st.session_state.last_docs = []
+        st.session_state.last_query = None
         st.session_state.last_query_embedding = None
         st.toast(f"Switched to model: {st.session_state.model_id}", icon="🤖")
 
@@ -520,6 +495,7 @@ with st.sidebar:
                 st.session_state.rag_chain = None
                 # Invalidation: Switching collections clears context + source cache
                 st.session_state.last_docs = []
+                st.session_state.last_query = None
                 st.session_state.last_query_embedding = None
                 st.session_state.pop(f"_source_names_cache_{chosen}", None)
                 st.success(f"Connected to **{chosen}**")
@@ -553,6 +529,7 @@ with st.sidebar:
         st.session_state.chat_history = []
         st.session_state.sentinel_state = ""
         st.session_state.last_docs = []
+        st.session_state.last_query = None
         st.session_state.last_query_embedding = None
         st.rerun()
 
@@ -564,9 +541,12 @@ with st.sidebar:
 
     # ── Cache Strategy ────────────────────────────────────────────────
     import config as _cfg
+    if "trust_native_cache" not in st.session_state:
+        st.session_state.trust_native_cache = _cfg.TRUST_NATIVE_CACHE
+
     trust_native = st.toggle(
         "Trust Native Cache",
-        value=_cfg.TRUST_NATIVE_CACHE,
+        value=st.session_state.trust_native_cache,
         help=(
             "When ON: always retrieve fresh chunks every turn. "
             "If the same chunks return, the provider cache kicks in at ~10% cost. "
@@ -575,8 +555,8 @@ with st.sidebar:
             "Faster, but risks serving wrong context if the topic subtly shifts."
         ),
     )
-    if trust_native != _cfg.TRUST_NATIVE_CACHE:
-        _cfg.TRUST_NATIVE_CACHE = trust_native
+    if trust_native != st.session_state.trust_native_cache:
+        st.session_state.trust_native_cache = trust_native
         st.toast(
             "Always-retrieve mode ON" if trust_native else "Semantic cache ON",
             icon="🔄" if trust_native else "⚡",
@@ -787,38 +767,8 @@ if user_input:
                 pinned_to_send = st.session_state.get("pinned_content", "None pinned.")
                 
                 # Build history: rely on Sentinel State when available
-                if st.session_state.sentinel_state and st.session_state.sentinel_state != "No summary generated yet.":
-                    # If we have a summary, only keep the immediate context (last 4 messages)
-                    truncated_history = lc_history[-4:]
-                    truncated_history = _truncate_ai_in_history(truncated_history)
-                else:
-                    # Fallback to ghost logic before the first summarization
-                    if len(lc_history) <= GHOST_HISTORY_MAX:
-                        truncated_history = _truncate_ai_in_history(lc_history)
-                    else:
-                        anchor = lc_history[:2]
-                        # Keep BOTH Human and AI messages in the ghost section,
-                        # but aggressively truncate AI responses so the model
-                        # still sees its own prior answers in condensed form.
-                        ghost_section = lc_history[2:-GHOST_HISTORY_WINDOW]
-                        ghosts = []
-                        for msg in ghost_section:
-                            if isinstance(msg, AIMessage):
-                                trimmed = msg.content[:GHOST_AI_CHARS]
-                                if len(msg.content) > GHOST_AI_CHARS:
-                                    trimmed += "\n... [truncated]"
-                                ghosts.append(AIMessage(content=trimmed))
-                            else:
-                                ghosts.append(msg)
-                        window = lc_history[-GHOST_HISTORY_WINDOW:]
-                        truncated_history = _truncate_ai_in_history(anchor + ghosts + window)
-
-                    # Hard token budget: drop oldest ghost messages until under budget
-                    def _est_tokens(msgs):
-                        return sum(len(m.content) for m in msgs) // 4
-                    while _est_tokens(truncated_history) > MAX_HISTORY_TOKENS and len(truncated_history) > 4:
-                        # Remove the 3rd message (first ghost after anchor pair)
-                        truncated_history.pop(2)
+                from rag_chain import compress_chat_history
+                truncated_history = compress_chat_history(lc_history, st.session_state.sentinel_state)
 
                 stream_iter = chain.stream({
                     "input": user_input,
@@ -826,10 +776,13 @@ if user_input:
                     "full_source_context": pinned_to_send,
                     "exclude_file": st.session_state.get("pinned_file"),
                     "cached_docs": cached_docs,
+                    "trust_native_cache": st.session_state.trust_native_cache,
+                    "last_query": st.session_state.get("last_query"),
                     "last_query_embedding": last_emb,
                     "force_retrieval": is_forced,
                     "collection_name": st.session_state.active_collection or "default",
                     "sentinel_state": st.session_state.sentinel_state,
+                    "sentinel_future_active": (st.session_state.get("sentinel_future") is not None),
                     "filter_extensions": st.session_state.filter_extensions or None,
                     "auto_specialist": st.session_state.auto_specialist,
                 })
@@ -853,6 +806,7 @@ if user_input:
 
                     if "query_embedding" in chunk:
                         st.session_state.last_query_embedding = chunk["query_embedding"]
+                        st.session_state.last_query = user_input
 
                     if "context" in chunk:
                         full_response["context"] = chunk["context"]
@@ -901,13 +855,14 @@ if user_input:
             answer = st.write_stream(response_generator())
             result = full_response
 
-            # Post-stream usage fetch — runs after response is fully rendered
-            # so the 1-second OpenRouter delay doesn't stall the displayed text.
+            # Post-stream usage fetch — detached background thread
             pending_gen_id = st.session_state.pop("_pending_generation_id", None)
             if pending_gen_id:
-                fetched = _fetch_generation_usage(pending_gen_id)
-                if fetched:
-                    st.session_state.token_usage = fetched
+                import threading
+                from streamlit.runtime.scriptrunner import add_script_run_ctx
+                t = threading.Thread(target=_bg_fetch_generation_usage, args=(pending_gen_id,), daemon=True)
+                add_script_run_ctx(t)
+                t.start()
 
             # Phase 5: Commit metrics to history
             usage = st.session_state.token_usage
@@ -951,10 +906,10 @@ if user_input:
                 for i, doc in enumerate(source_docs, 1):
                     src_file = doc.metadata.get("source", "Unknown")
                     st.markdown(f"**Chunk {i}** — `{src_file}`")
-                    st.code(doc.page_content[:500], language="text")
+                    st.code(doc.page_content, language="text")
                     sources_meta.append({
                         "source": src_file,
-                        "content": doc.page_content[:500],
+                        "content": doc.page_content,
                     })
 
         # Debug panel — retrieval details & reranker scores

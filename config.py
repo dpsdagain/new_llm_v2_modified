@@ -81,10 +81,6 @@ CHROMA_DB_DIR: str = os.path.join(os.path.dirname(__file__), "chroma_db")
 RETRIEVER_K: int = 4            # top-k chunks for similarity search
 RETRIEVER_FETCH_K: int = 20     # MMR fetches more, then picks diverse top-k
 
-# ── Re-ranker (runs locally, ~80 MB) ──────────────────────────────────────
-RERANKER_MODEL_NAME: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-RERANKER_TOP_N: int = 4         # documents surviving re-ranking
-
 # ── Search signal thresholds ───────────────────────────────────────────────
 MIN_PREV_QUERY_LENGTH: int = 15   # min length of previous query to include in search signal
 MIN_CURRENT_QUERY_LENGTH: int = 10  # below this, always augment with previous query
