@@ -1,0 +1,3 @@
+This is a small test file for zero chunking verification.
+It should be ingested as a single chunk.
+Lorem ipsum dolor sit amet, consectetur adipiscing elit.

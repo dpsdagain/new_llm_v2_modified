@@ -28,7 +28,6 @@ CLOUDROUTER_MODELS = {
         "Qwen 3.6 Plus (Free)": "qwen/qwen3.6-plus:free",
     },
     "Ollama Cloud Elite (2026)": {
-        "Kimi K2.6 (Coding SOTA)": "ollama-cloud:kimi-k2.6:cloud",
         "MiniMax M2.5 (Agentic)": "ollama-cloud:minimax-m2.5:cloud",
         "Qwen 3.6 Coder (Logic)": "ollama-cloud:qwen3.6-coder:32b-cloud",
         "DeepSeek R1 (Finance)": "ollama-cloud:deepseek-r1:70b-cloud",
@@ -116,8 +115,6 @@ PROVIDER_CACHE_PROFILES = {
     "reka":      (4, 1024),
     "mistral":   (4, 1024),
     "gpt-oss":   (4, 1024),
-    "kimi":      (4, 1024),
-    "minimax":   (4, 1024),
 }
 
 USE_RERANKER = True

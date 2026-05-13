@@ -1,0 +1,5 @@
+# settings.py - Global settings
+RETRY_STRATEGY_ID = "FAIL_FAST"
+MAX_RETRIES = 0
+LOG_LEVEL = "DEBUG"
+DB_TIMEOUT = 30

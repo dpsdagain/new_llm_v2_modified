@@ -1,0 +1,10 @@
+
+
+================================================================================
+QUERY: Trace the exact execution path of a user's chat message from the moment they hit enter in app.py until the final LLM token is streamed back to the UI. Name every specific custom function and file the text payload passes through.
+================================================================================
+GENERATOR STARTED
+LOCALS INIT
+STEP: SemanticCache.lookup for 'Trace the exact execution path...'
+STEP: Calling similarity_search_with_relevance_scores
+STEP: similarity_search DONE

@@ -1,0 +1,36 @@
+--- 0. Ingesting F:\Gemini_anti\new_llm_v3\new_llm_v2_modified\test_shadow_env ---
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/199 [00:00<?, ?it/s]Loading weights: 100%|██████████| 199/199 [00:00<00:00, 2542.21it/s]
+[1mBertModel LOAD REPORT[0m from: BAAI/bge-small-en-v1.5
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+Ingested 42 chunks.
+
+DIAGNOSTIC FOR QUERY: 'I'm seeing immediate failures in network_manager.py. Why isn't the retry logic working?'
+
+--- 1. STANDARD HYBRID SEARCH (Vector + BM25) ---
+[0] F:\Gemini_anti\new_llm_v3\new_llm_v2_modified\test_shadow_env\network_manager.py
+[1] F:\Gemini_anti\new_llm_v3\new_llm_v2_modified\test_shadow_env\settings.py
+[2] F:\Gemini_anti\new_llm_v3\new_llm_v2_modified\test_shadow_env\distractor_20.py
+[3] F:\Gemini_anti\new_llm_v3\new_llm_v2_modified\test_shadow_env\distractor_19.py
+[4] F:\Gemini_anti\new_llm_v3\new_llm_v2_modified\test_shadow_env\distractor_32.py
+[5] F:\Gemini_anti\new_llm_v3\new_llm_v2_modified\test_shadow_env\distractor_15.py
+[6] F:\Gemini_anti\new_llm_v3\new_llm_v2_modified\test_shadow_env\distractor_21.py
+[7] F:\Gemini_anti\new_llm_v3\new_llm_v2_modified\test_shadow_env\distractor_18.py
+[8] F:\Gemini_anti\new_llm_v3\new_llm_v2_modified\test_shadow_env\distractor_14.py
+[9] F:\Gemini_anti\new_llm_v3\new_llm_v2_modified\test_shadow_env\distractor_16.py
+
+RESULT: Standard search found settings.py (unlikely but possible).
+
+==================================================
+
+--- 2. ANCHOR TERM PROPAGATION (Targeted Search) ---
+Searching for definition of anchor term: 'RETRY_STRATEGY_ID'...
+[0] F:\Gemini_anti\new_llm_v3\new_llm_v2_modified\test_shadow_env\network_manager.py
+[1] F:\Gemini_anti\new_llm_v3\new_llm_v2_modified\test_shadow_env\settings.py
+
+RESULT: Propagation search SUCCESS! Found RETRY_STRATEGY_ID in settings.py.

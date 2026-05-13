@@ -285,47 +285,10 @@ def format_message_content(text: str, model: str | None, use_cache: bool = False
     ]
 
 
-# Substrings identifying reasoning-capable model families. Match is
-# case-insensitive on the full model id. We err on the side of showing
-# the toggle: a model that doesn't support reasoning will simply ignore
-# the `think` parameter (Ollama silently drops unknown options).
-# Substrings identifying reasoning-capable model families. Gemma 4
-# (April 2026) added native `think` API support, unlike Gemma 1/2/3 —
-# include "gemma4" specifically so older Gemma variants don't pick up
-# the toggle by mistake.
-_THINKING_MODEL_PATTERNS = (
-    "gpt-oss", "deepseek", "qwen", "minimax", "kimi",
-    "gemma4", "gemma-4",
-    "lfm-2.5-1.2b-thinking", "r1", "thinking",
-)
-
-
-def model_supports_thinking(model_id: str | None) -> bool:
-    """Return True if `model_id` looks like a reasoning-capable model."""
-    if not model_id:
-        return False
-    m = model_id.lower()
-    return any(p in m for p in _THINKING_MODEL_PATTERNS)
-
-
-def model_supports_num_ctx(model_id: str | None) -> bool:
-    """Return True if `model_id` is an Ollama (local or cloud) model.
-
-    Only Ollama exposes `num_ctx` on a per-call basis. OpenRouter models
-    use whatever context window the upstream provider configured.
-    """
-    if not model_id:
-        return False
-    return model_id.startswith(OLLAMA_PREFIX) or model_id.startswith(OLLAMA_CLOUD_PREFIX)
-
-
 def get_llm(
     model: str | None = None,
     temperature: float | None = None,
     streaming: bool = True,
-    *,
-    think: bool | None = None,
-    num_ctx: int | None = None,
 ):
     """
     Return a chat model instance.
@@ -333,18 +296,11 @@ def get_llm(
     If *model* is ``OLLAMA_SENTINEL`` the function returns a local
     ``ChatOllama``; otherwise it returns a ``ChatOpenAI`` pointed at
     OpenRouter.
-
-    Per-call tuning (Ollama family only):
-      * ``think``  — None = model default, True = reasoning on,
-        False = reasoning off. Ignored for OpenRouter models.
-      * ``num_ctx`` — context-window override in tokens. Ignored for
-        OpenRouter models (the upstream provider chooses).
     """
     temp = temperature if temperature is not None else LLM_TEMPERATURE
-
-    # 🚀 Cache Check (thread-safe). Include think/num_ctx so toggling
-    # them doesn't return a stale handle from a previous call.
-    cache_key = (model, temp, streaming, think, num_ctx)
+    
+    # 🚀 Cache Check (thread-safe)
+    cache_key = (model, temp, streaming)
     with _llm_cache_lock:
         if cache_key in _llm_cache:
             return _llm_cache[cache_key]
@@ -357,18 +313,12 @@ def get_llm(
     # ── Local Ollama path ──────────────────────────────────────────────
     if model and model.startswith(OLLAMA_PREFIX):
         ollama_model_name = model[len(OLLAMA_PREFIX):]
-        ollama_kwargs: dict = {
-            "base_url": OLLAMA_BASE_URL,
-            "model": ollama_model_name,
-            "temperature": temp,
-            "num_predict": MAX_TOKENS,
-        }
-        # ChatOllama exposes these natively.
-        if num_ctx is not None:
-            ollama_kwargs["num_ctx"] = num_ctx
-        if think is not None:
-            ollama_kwargs["reasoning"] = think
-        return _cache_and_return(ChatOllama(**ollama_kwargs))
+        return _cache_and_return(ChatOllama(
+            base_url=OLLAMA_BASE_URL,
+            model=ollama_model_name,
+            temperature=temp,
+            num_predict=MAX_TOKENS,
+        ))
 
     # ── Ollama Cloud path ──────────────────────────────────────────────
     if model and model.startswith(OLLAMA_CLOUD_PREFIX):
@@ -378,41 +328,14 @@ def get_llm(
                 "OLLAMA_CLOUD_API_KEY is not set. "
                 "Add it to your .env file."
             )
-        # Ollama Cloud is reached via the OpenAI-compatible REST API.
-        # Two field-shape gotchas verified against Ollama issues #14820
-        # and #7063 (April 2026):
-        #
-        #   * THINKING: the native `think:true/false` field is IGNORED
-        #     by the OpenAI-compat layer. The working route is the
-        #     standard OpenAI `reasoning_effort` field, which Ollama
-        #     maps internally — values "high"/"medium"/"low" enable
-        #     thinking with varying effort, "none" disables it.
-        #   * CONTEXT: pass `num_ctx` at the TOP LEVEL of the request
-        #     body. Nesting it under `options` (the native Ollama API
-        #     shape) is silently dropped by the compat layer.
-        #
-        # `extra_body` is a TOP-LEVEL ChatOpenAI kwarg (NOT nested in
-        # model_kwargs — LangChain warns and silently drops the entry
-        # if you nest it). The OpenAI SDK forwards `extra_body` keys
-        # straight into the request JSON at the top level.
-        extra_body: dict = {}
-        if num_ctx is not None:
-            extra_body["num_ctx"] = num_ctx
-        if think is True:
-            extra_body["reasoning_effort"] = "high"
-        elif think is False:
-            extra_body["reasoning_effort"] = "none"
-        cloud_kwargs: dict = {
-            "base_url": OLLAMA_CLOUD_BASE_URL,
-            "api_key": OLLAMA_CLOUD_API_KEY,
-            "model": cloud_model_name,
-            "temperature": temp,
-            "streaming": streaming,
-            "max_tokens": MAX_TOKENS,
-        }
-        if extra_body:
-            cloud_kwargs["extra_body"] = extra_body
-        return _cache_and_return(ChatOpenAI(**cloud_kwargs))
+        return _cache_and_return(ChatOpenAI(
+            base_url=OLLAMA_CLOUD_BASE_URL,
+            api_key=OLLAMA_CLOUD_API_KEY,
+            model=cloud_model_name,
+            temperature=temp,
+            streaming=streaming,
+            max_tokens=MAX_TOKENS,
+        ))
 
     # ── OpenRouter path ────────────────────────────────────────────────
     if not OPENROUTER_API_KEY:
@@ -569,7 +492,6 @@ INSTRUCTIONS:
 6. The 'CONVERSATION STATE' section contains a summary of our past discussion. \
    You MUST use it to understand follow-up questions and you MUST report its contents if the user asks what it says.
 7. CRITICAL OVERRIDE: If the user asks you to retrieve or read the 'CONVERSATION STATE', do NOT explain the python codebase or how variables like {sentinel_state} work. Look physically below at the text under the heading 'CONVERSATION STATE:' and copy it exactly word-for-word. Even if there are no bullet points and it says "No summary generated yet.", you must reply with exactly that text.
-8. CORPUS META-QUESTIONS: For questions like "how many files do you see", "list all files", "which files are in the corpus", or "do you have file X", you MUST answer from the 'INGESTED CORPUS' block — that list is authoritative and complete. Do NOT count or list files based on the chunks under 'STABLE RAG CONTEXT' or 'NEW RAG DISCOVERIES'; those reflect only the top-K chunks retrieved for the current question and will under-report the corpus.
 """
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1027,70 +949,11 @@ def _content_len(c) -> int:
     return 0
 
 
-# Cap on how many source paths we inline in the corpus manifest.  Beyond
-# this we show the count + a truncated list so the prompt doesn't blow up
-# on multi-thousand-file codebases.
-_MANIFEST_MAX_INLINE = 250
-
-
-def _format_corpus_manifest(coll_name: str) -> str:
-    """Produce a stable, token-efficient summary of every file in the index.
-
-    Injected into the system prompt so meta-questions ("how many files?",
-    "list everything", "do you have X?") get answered from authoritative
-    metadata instead of guessed from top-K retrieved chunks. Without this,
-    the LLM only sees source paths attached to chunks that happened to
-    surface for the current query — it has no view of the full corpus.
-
-    Returns a single string. Sorted for prefix-cache stability (ordering
-    must not depend on the user's question).
-    """
-    try:
-        from backend import get_collection_info
-        info = get_collection_info(coll_name)
-    except Exception:
-        return "Corpus manifest unavailable."
-
-    sources = info.get("sources", []) or []
-    count = info.get("count", 0)
-    n_files = len(sources)
-    if n_files == 0:
-        return "INGESTED CORPUS: empty (no documents indexed)."
-
-    if n_files <= _MANIFEST_MAX_INLINE:
-        listed = sources
-        suffix = ""
-    else:
-        listed = sources[:_MANIFEST_MAX_INLINE]
-        suffix = f"\n  ... and {n_files - _MANIFEST_MAX_INLINE} more files (truncated)."
-
-    bullets = "\n".join(f"  - {s}" for s in listed)
-    return (
-        f"INGESTED CORPUS (collection={coll_name}): "
-        f"{n_files} distinct source files, {count} total chunks.\n"
-        f"This list is authoritative for questions like 'how many files', "
-        f"'list all files', or 'is X in the corpus'. Do not infer file "
-        f"counts from retrieved chunks — use this manifest.\n"
-        f"{bullets}{suffix}"
-    )
-
-
-def build_rag_chain(
-    db: Chroma,
-    model: str | None = None,
-    *,
-    think: bool | None = None,
-    num_ctx: int | None = None,
-):
+def build_rag_chain(db: Chroma, model: str | None = None):
     """
     Build a retrieval chain with stable Full-Context Caching (Architecture A).
-
-    Per-call Ollama tuning is plumbed through to ``get_llm``:
-      * ``think``  — enable reasoning ("thinking") output for supported models.
-      * ``num_ctx`` — Ollama context-window override in tokens.
-    Pass ``None`` (default) to leave each unspecified.
     """
-    llm = get_llm(model=model, think=think, num_ctx=num_ctx)
+    llm = get_llm(model=model)
     
     # 🚀 Professional Polish: Dynamic Retrieval Configuration
     # We build our retrievers inside the lambda to support the 
@@ -1115,15 +978,9 @@ def build_rag_chain(
         # get cache_control markers, so placing the volatile sentinel and
         # new-discoveries at the end avoids invalidating the prefix cache
         # every turn.
-        # Manifest sits between pinned context and stable RAG context:
-        #   - more stable than RAG/sentinel/new_context (changes only on
-        #     re-ingest, not per-turn), so it benefits from caching.
-        #   - placed AFTER pinned so a re-ingest doesn't invalidate the
-        #     pinned-file cache slot, which is the most expensive to rebuild.
         block_specs = [
             static_system_text,
             "FULL SOURCE CONTEXT (PINNED):\n{full_source_context}",
-            "{corpus_manifest}",
             "STABLE RAG CONTEXT (DETERMINISTIC):\n{stable_context}",
             "CONVERSATION STATE:\n{sentinel_state}",
             "NEW RAG DISCOVERIES:\n{new_context}"
@@ -1153,7 +1010,6 @@ def build_rag_chain(
         system_text = (
             f"{CORE_INSTRUCTIONS}\n\n"
             "FULL SOURCE CONTEXT (PINNED):\n{full_source_context}\n\n"
-            "{corpus_manifest}\n\n"
             "STABLE RAG CONTEXT (DETERMINISTIC):\n{stable_context}\n\n"
             "CONVERSATION STATE:\n{sentinel_state}\n\n"
             "NEW RAG DISCOVERIES:\n{new_context}"
@@ -1215,12 +1071,6 @@ def build_rag_chain(
         inputs["stable_context"] = inputs.get("stable_context", "None previously established.")
         inputs["new_context"] = inputs.get("new_context", "No new discoveries.")
         inputs["chat_history"] = inputs.get("chat_history", [])
-        # Inject the authoritative corpus manifest so meta-questions
-        # ("how many files?", "list everything") don't depend on retrieval.
-        # get_collection_info is in-process cached and invalidated on
-        # ingest/delete, so this is one dict lookup on the hot path.
-        if "corpus_manifest" not in inputs:
-            inputs["corpus_manifest"] = _format_corpus_manifest(coll_name)
 
         # 2. Context Awareness (Latency-Free)
         # Use the true global turn count from app.py — compressed history

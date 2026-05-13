@@ -131,9 +131,8 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "active_collection" not in st.session_state:
     st.session_state.active_collection = None
-# active_switch session-state init removed — the "Ollama Cloud Switches"
-# UI was non-functional and has been deleted. See the matching note in
-# the sidebar for why slash-command prefixes don't work over HTTP APIs.
+if "active_switch" not in st.session_state:
+    st.session_state.active_switch = "None"
 if "rag_chain" not in st.session_state:
     st.session_state.rag_chain = None
 if "model_id" not in st.session_state:
@@ -349,32 +348,22 @@ with st.sidebar:
     
     # 1. Choose Category
     categories = list(CLOUDROUTER_MODELS.keys()) + ["Local (Ollama)"]
+    
+    # Determine initial category
     current_mid = st.session_state.model_id
-
-    # Seed the category selectbox key ONCE from the active model.
-    # Using `key=` (instead of recomputed `index=`) keeps the user's
-    # selection sticky across reruns; otherwise picking a category but
-    # not yet picking a model would snap back to the active model's
-    # category whenever any unrelated rerun fires.
-    if "sidebar_model_category" not in st.session_state:
-        if current_mid.startswith(OLLAMA_PREFIX):
-            st.session_state.sidebar_model_category = "Local (Ollama)"
-        elif current_mid.startswith(OLLAMA_CLOUD_PREFIX):
-            st.session_state.sidebar_model_category = "Ollama Cloud (New)"
-        else:
-            st.session_state.sidebar_model_category = (
-                model_to_category.get(current_mid, (categories[0], ""))[0]
-            )
-        # Defensive: if the seeded value isn't in the current options, reset.
-        if st.session_state.sidebar_model_category not in categories:
-            st.session_state.sidebar_model_category = categories[0]
-
+    if current_mid.startswith(OLLAMA_PREFIX):
+        initial_cat = "Local (Ollama)"
+    elif current_mid.startswith(OLLAMA_CLOUD_PREFIX):
+        initial_cat = "Ollama Cloud (New)"
+    else:
+        initial_cat = model_to_category.get(current_mid, (categories[0], ""))[0]
+    
     selected_cat = st.selectbox(
         "Model Tier / Specialisation",
         options=categories,
-        key="sidebar_model_category",
+        index=categories.index(initial_cat) if initial_cat in categories else 0
     )
-
+    
     # 2. Choose Model within Category
     if selected_cat == "Local (Ollama)":
         if not OLLAMA_MODELS:
@@ -382,27 +371,15 @@ with st.sidebar:
             new_model_id = DEFAULT_MODEL
         else:
             local_options = {m: f"{OLLAMA_PREFIX}{m}" for m in OLLAMA_MODELS}
-            # Per-category key so switching categories starts fresh.
-            selected_local = st.selectbox(
-                "Select local model",
-                options=list(local_options.keys()),
-                key="sidebar_local_model",
-            )
+            selected_local = st.selectbox("Select local model", options=list(local_options.keys()))
             new_model_id = local_options[selected_local]
     else:
         # Cloud models
         tier_models = CLOUDROUTER_MODELS[selected_cat]
-        # Use a per-category key so each category's selection is
-        # independent. The `index=` arg seeds the FIRST render only.
-        sel_key = f"sidebar_cloud_model_{selected_cat}"
-        if sel_key not in st.session_state and current_mid in tier_models.values():
-            st.session_state[sel_key] = next(
-                k for k, v in tier_models.items() if v == current_mid
-            )
         selected_model_name = st.selectbox(
             f"Select {selected_cat} AI",
             options=list(tier_models.keys()),
-            key=sel_key,
+            index=list(tier_models.values()).index(current_mid) if current_mid in tier_models.values() else 0
         )
         new_model_id = tier_models[selected_model_name]
 
@@ -427,76 +404,25 @@ with st.sidebar:
 
     st.divider()
 
-    # ── Model Tuning ───────────────────────────────────────────────────
-    # Real per-call options sent through the API, not prompt-text prefixes.
-    # Each control is shown only for models that actually support it.
-    from rag_chain import model_supports_thinking, model_supports_num_ctx
+    # 🎛️ Phase 6: Ollama Cloud Switches
+    st.markdown("### 🎛️ Ollama Cloud Switches")
+    switch_options = {
+        "None": "None",
+        "MiniMax - Agentic Loop (/act)": "/act",
+        "Qwen Coder - Reasoning (/think)": "/think",
+        "DeepSeek - Reasoning (/think)": "/think",
+        "Llama 4 - 10M Context (/context)": "/set context 10M",
+        "Gemma 4 - Turbo Mode (/turbo)": "/set turbo",
+    }
+    selected_switch_label = st.radio(
+        "Active Logic Switch",
+        options=list(switch_options.keys()),
+        index=list(switch_options.keys()).index("None") if "None" in switch_options else 0,
+        help="Prepend special commands to your query to unlock 2026-tier model features."
+    )
+    st.session_state.active_switch = switch_options[selected_switch_label]
 
-    supports_think = model_supports_thinking(st.session_state.model_id)
-    supports_ctx   = model_supports_num_ctx(st.session_state.model_id)
-
-    if supports_think or supports_ctx:
-        st.markdown("### 🎛️ Model Tuning")
-
-        if supports_think:
-            new_think = st.toggle(
-                "Thinking Mode (reasoning)",
-                value=st.session_state.get("think_mode", False),
-                help=(
-                    "Forces reasoning-capable models (gpt-oss, DeepSeek, Qwen, "
-                    "MiniMax, LFM Thinking) to emit a chain-of-thought block "
-                    "before the final answer. Slower but better on hard "
-                    "logic / multi-step questions."
-                ),
-                key="think_mode_toggle",
-            )
-            if new_think != st.session_state.get("think_mode", False):
-                st.session_state.think_mode = new_think
-                # Rebuild chain so the new param flows through get_llm.
-                st.session_state.rag_chain = None
-                st.toast(
-                    f"Thinking Mode {'ON' if new_think else 'OFF'}",
-                    icon="🧠" if new_think else "💤",
-                )
-        else:
-            # Wipe any prior preference so cache keys don't drift when
-            # user switches to a non-thinking model.
-            st.session_state.pop("think_mode", None)
-
-        if supports_ctx:
-            ctx_options = {
-                "Default (model)": None,
-                "8K": 8192,
-                "16K": 16384,
-                "32K": 32768,
-                "64K": 65536,
-                "128K": 131072,
-                "1M": 1_000_000,
-                "10M (Llama 4 Scout)": 10_000_000,
-            }
-            current_label = st.session_state.get("num_ctx_label", "Default (model)")
-            if current_label not in ctx_options:
-                current_label = "Default (model)"
-            new_label = st.selectbox(
-                "Context Window",
-                options=list(ctx_options.keys()),
-                index=list(ctx_options.keys()).index(current_label),
-                help=(
-                    "Override the Ollama `num_ctx` option for this model. "
-                    "Larger windows allow more context but cost more tokens "
-                    "and memory. Leave at Default unless you hit a context "
-                    "ceiling."
-                ),
-                key="num_ctx_select",
-            )
-            if new_label != current_label:
-                st.session_state.num_ctx_label = new_label
-                st.session_state.num_ctx = ctx_options[new_label]
-                st.session_state.rag_chain = None
-                st.toast(f"Context window: {new_label}", icon="📏")
-        else:
-            st.session_state.pop("num_ctx", None)
-            st.session_state.pop("num_ctx_label", None)
+    st.divider()
 
     # ── Pinned Context (Architecture A) ────────────────────────────────
     st.markdown("### 📌 Pinned Context")
@@ -595,25 +521,9 @@ with st.sidebar:
         # 🚀 Fix: Use background task for PDF ingestion
         import tempfile
         from pathlib import Path
-
-        # Validate magic bytes before kicking off ingestion. The
-        # `type=["pdf"]` filter on st.file_uploader is just a UI hint —
-        # users can drop a renamed ZIP / HTML / image, which would
-        # otherwise crash deep inside the PDF loader.
-        # Real PDFs start with %PDF-1.x. Some tools prepend a few bytes
-        # of garbage so we scan the first 1024.
-        raw_bytes = uploaded_pdf.read()
-        head = raw_bytes[:1024]
-        if b"%PDF-" not in head:
-            st.error(
-                "❌ This file isn't a valid PDF (missing %PDF- header). "
-                "Was the extension renamed?"
-            )
-            st.stop()
-
         suffix = Path(uploaded_pdf.name).suffix or ".pdf"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(raw_bytes)
+            tmp.write(uploaded_pdf.read())
             tmp_path = tmp.name
 
         from backend import AsyncIngestionTask
@@ -701,17 +611,6 @@ with st.sidebar:
         st.session_state.last_docs = []
         st.session_state.last_query = None
         st.session_state.last_query_embedding = None
-        # Drop the chain so the sentinel cooldown closure resets too.
-        # Without this, _sentinel_cooldown["last_turn"] still holds the
-        # last-fired turn from the PREVIOUS chat. After Clear Chat the
-        # turn counter restarts at 0, so the cooldown check
-        # (turn_count - last_turn) >= SENTINEL_INTERVAL stays False
-        # for many turns and the summarizer goes silent.
-        st.session_state.rag_chain = None
-        # Wipe the perf chart too — otherwise it shows turn 1, 2, 3...
-        # for an empty chat history. Same lifetime as the conversation.
-        st.session_state.metrics_history = []
-        st.session_state.specialist_counts = {"CODE": 0, "REASONING": 0, "VISION": 0, "GENERAL": 0}
         st.rerun()
 
     st.divider()
@@ -752,9 +651,7 @@ with st.sidebar:
         default=[],
         help="Only retrieve chunks from files with these extensions. Leave empty for all."
     )
-    # multiselect already returns [] when nothing is selected; downstream
-    # code at chain-invoke time turns [] into None via `or None`.
-    st.session_state.filter_extensions = selected_filters
+    st.session_state.filter_extensions = selected_filters if selected_filters else []
 
     st.divider()
 
@@ -762,22 +659,15 @@ with st.sidebar:
     st.markdown("### ⚡ Semantic Cache")
     if st.button("🗑️ Clear Semantic Cache", use_container_width=True):
         from rag_chain import reset_semantic_cache
-        from backend import _get_chroma_client
+        import chromadb
+        from config import CHROMA_DB_DIR
         try:
             # Drop the in-memory singleton first so the next call rebuilds against
             # a fresh collection instead of holding a handle to the deleted one.
             reset_semantic_cache()
-            # Reuse the singleton client. Constructing a second
-            # PersistentClient on the same SQLite file can corrupt locks
-            # and leaves the original singleton holding a stale handle to
-            # the just-deleted collection.
-            client = _get_chroma_client()
-            try:
-                client.delete_collection("semantic_cache")
-                st.success("Semantic cache cleared!")
-            except Exception:
-                # Collection didn't exist (e.g., user clicked twice). Not an error.
-                st.info("Semantic cache was already empty.")
+            client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
+            client.delete_collection("semantic_cache")
+            st.success("Semantic cache cleared!")
             st.rerun()
         except Exception as e:
             st.error(f"Could not clear cache: {e}")
@@ -880,13 +770,10 @@ if st.session_state.ingestion_task:
         # being served after the knowledge base changes.
         try:
             from rag_chain import reset_semantic_cache
-            from backend import _get_chroma_client
+            import chromadb
+            from config import CHROMA_DB_DIR
             reset_semantic_cache()
-            # Reuse the singleton (see sidebar Clear-Cache for rationale).
-            try:
-                _get_chroma_client().delete_collection("semantic_cache")
-            except Exception:
-                pass  # collection didn't exist
+            chromadb.PersistentClient(path=CHROMA_DB_DIR).delete_collection("semantic_cache")
             logger.info("Semantic cache auto-cleared after ingestion.")
         except Exception:
             pass  # Cache may not exist yet — harmless
@@ -934,6 +821,10 @@ for msg in st.session_state.chat_history:
 user_input = st.chat_input("Ask a question about your documents or code…")
 
 if user_input:
+    # 🎛️ Phase 6: Apply Active Switch
+    if st.session_state.active_switch != "None":
+        user_input = f"{st.session_state.active_switch}\n{user_input}"
+
     # Display user message
     st.session_state.chat_history.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
@@ -959,12 +850,7 @@ if user_input:
             st.stop()
         try:
             st.session_state.vector_db = db  # 🚀 Fix: Persist DB for embedding access (may be None)
-            st.session_state.rag_chain = build_rag_chain(
-                db,
-                model=st.session_state.model_id,
-                think=st.session_state.get("think_mode"),
-                num_ctx=st.session_state.get("num_ctx"),
-            )
+            st.session_state.rag_chain = build_rag_chain(db, model=st.session_state.model_id)
         except ValueError as e:
             with st.chat_message("assistant"):
                 st.error(f"⚙️ {e}")

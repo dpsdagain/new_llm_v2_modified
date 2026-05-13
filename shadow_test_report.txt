@@ -1,0 +1,70 @@
+--- 1. Ingesting f:\Gemini_anti\new_llm_v3\new_llm_v2_modified\test_shadow_env ---
+Found 42 chunks.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/199 [00:00<?, ?it/s]Loading weights: 100%|██████████| 199/199 [00:00<00:00, 2315.62it/s]
+[1mBertModel LOAD REPORT[0m from: BAAI/bge-small-en-v1.5
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+Ingested 42 chunks into shadow_test_coll.
+--- 2. Initializing RAG Chain with openai/gpt-oss-120b:free ---
+Loading weights:   0%|          | 0/105 [00:00<?, ?it/s]Loading weights: 100%|██████████| 105/105 [00:00<00:00, 1918.71it/s]
+[1mBertForSequenceClassification LOAD REPORT[0m from: cross-encoder/ms-marco-MiniLM-L-6-v2
+Key                          | Status     |  | 
+-----------------------------+------------+--+-
+bert.embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+Query: I'm seeing immediate failures in network_manager.py. Why isn't the retry logic working?
+--- 3. Running Query ---
+The retry logic in **`network_manager.py`** is controlled by the values defined in **`settings.py`**.
+
+### What the code does
+```python
+# network_manager.py
+from settings import RETRY_STRATEGY_ID, MAX_RETRIES
+
+def perform_api_call(endpoint, payload):
+    print(f"Calling {endpoint} using {RETRY_STRATEGY_ID} strategy.")
+    
+    for i in range(MAX_RETRIES + 1):          # ← loop runs MAX_RETRIES+1 times
+        try:
+            return _mock_call(endpoint, payload)
+        except Exception as e:
+            if RETRY_STRATEGY_ID == "FAIL_FAST":
+                print("FAIL_FAST strategy: no retries allowed.")
+                raise RuntimeError("Immediate failure per strategy.") from e
+            print(f"Attempt {i+1} failed, retrying...")
+    return None
+```
+
+### Current settings
+```python
+# settings.py
+RETRY_STRATEGY_ID = "FAIL_FAST"
+MAX_RETRIES = 0
+```
+
+### Why you see immediate failures
+1. **`RETRY_STRATEGY_ID` is set to `"FAIL_FAST"`** – the code explicitly checks for this value and, when it matches, raises a `RuntimeError` the **first** time an exception occurs, bypassing any retry attempts.
+2. **`MAX_RETRIES` is `0`** – even if the strategy allowed retries, the loop would only execute once (`range(0 + 1)`), giving you no extra attempts.
+
+Because both conditions are true, the function prints “FAIL_FAST strategy: no retries allowed.” and raises an exception right away, which is why you’re seeing immediate failures.
+
+### How to enable retries
+- **Change the strategy** to something other than `"FAIL_FAST"` (e.g., `"RETRY"`).  
+- **Increase `MAX_RETRIES`** to the number of retries you want (e.g., `MAX_RETRIES = 3`).
+
+```python
+# settings.py (example)
+RETRY_STRATEGY_ID = "RETRY"
+MAX_RETRIES = 3
+```
+
+After updating these settings, `perform_api_call` will attempt the mock call up to `MAX_RETRIES + 1` times, printing “Attempt X failed, retrying...” on each failure before finally returning `None` if all attempts fail.
+--- FINAL ANALYSIS ---
+✅ SUCCESS: The system successfully linked the bug to the hidden configuration!

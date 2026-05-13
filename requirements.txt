@@ -15,4 +15,6 @@ numpy>=1.26.0
 rank-bm25>=0.2.2
 nltk>=3.8.1
 chardet>=5.2.0
+tree-sitter>=0.21.0
+tree-sitter-languages>=1.10.0
 
